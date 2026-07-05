@@ -1,0 +1,15 @@
+# сборка
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# локальные настройки и результаты
+nms_station_settings.json
+NMS_INDEX/
+*.zip
+
+# сторонние бинарники (скачиваются отдельно)
+MBINCompiler*.exe
+NMS_Station.exe
