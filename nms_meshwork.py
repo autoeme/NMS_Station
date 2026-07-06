@@ -583,6 +583,12 @@ def descriptor_variant(oid, links, extr, geodirs):
             sub, opt = cand, "".join(rest[cut2:])
             break
     if not sub:
+        # вариант без токена группы (FOS_HEAD_AA: базовая деталь FOS_HEAD — сама
+        # стенд группы) — имя сцены-куска = последний токен базовой детали
+        cand = bdir + "/" + base.split("_")[-1].lower() + ".scene.mbin"
+        if cand in extr.man:
+            sub, opt = cand, "".join(rest)
+    if not sub:
         return None
     sfile = ensure_tree(sub, extr, geodirs)
     dmx = _fetch_descriptor(sub, extr)
