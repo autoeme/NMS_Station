@@ -274,8 +274,9 @@ def P(el, name):
     return None
 
 
-def scene_lod0(scene_file, depth=0, seen=None, relax=False):
+def scene_lod0(scene_file, depth=0, seen=None, relax=False, extra=""):
     skip_re = SKIPREF_RELAX if relax else SKIPREF
+    extra_rx = re.compile(extra, re.I) if extra else None
     if seen is None:
         seen = set()
     if scene_file in seen or depth > 6:
@@ -305,6 +306,8 @@ def scene_lod0(scene_file, depth=0, seen=None, relax=False):
         if nm is None or tp is None:
             return
         name, typ = nm.get("value").split("|")[-1], tp.get("value")
+        if extra_rx and extra_rx.search(name):
+            return  # невыбранная опция дескриптора — всё поддерево мимо
         m = LODRE.search(name.lower())
         lod = int(m.group(1)) if m else lod_ctx
         aa = attrs_of(node)
@@ -318,7 +321,7 @@ def scene_lod0(scene_file, depth=0, seen=None, relax=False):
             if sg and not skip_re.search((name + sg).lower()):
                 rf = resolve_scene_file(sg)
                 if rf:
-                    t2, m2 = scene_lod0(rf, depth + 1, seen, relax)
+                    t2, m2 = scene_lod0(rf, depth + 1, seen, relax, extra)
                     tris += t2
                     for x in m2:
                         if x not in mats:
@@ -519,6 +522,95 @@ def placement_entity_partid(placement_path, extr):
     return rules[0][0]
 
 
+# ------------------------------------------------------------------ ДЕСКРИПТОРЫ (варианты)
+# «Как игра строит такие цепочки» (запрос юзера 07.07, фоссилы): рядом со сценой лежит
+# *.DESCRIPTOR.MBIN — штатная система вариантов игры. body.descriptor: опции _BODY_A +
+# _BODYAACC_A..E(+NULL) -> каталожные FOS_BI_BODY_AA/AB/... = КОМБИНАЦИИ опций (буква на
+# группу опций по порядку; N/нет буквы = NULL). Строим вариант, ИСКЛЮЧАЯ узлы невыбранных
+# опций (той же перестройкой SKIPNAME конвертера — сам conv2026 не трогается).
+
+def _fetch_descriptor(scene_game, extr):
+    """*.descriptor.MXML рядом со сценой (из паков, кэш в MW)."""
+    if extr is None:
+        return None
+    key = _norm(scene_game).replace(".scene.mbin", ".descriptor.mbin")
+    return extr.fetch_decode(key, os.path.join(MW, _flat(key.replace(".descriptor.mbin", "")) + ".descriptor.mbin"))
+
+
+def _descriptor_groups(mx):
+    """[(префикс_группы, [опции])] в порядке файла: '_BODY': ['A','NULL'], '_BODYAACC': [...]."""
+    t = open(mx, encoding="utf-8", errors="replace").read()
+    ids = re.findall(r'name="Id" value="([^"]+)"', t)
+    groups, order = {}, []
+    for i in ids:
+        m = re.match(r"^(_.+)_([A-Z]{1,4}|NULL)$", i)
+        if not m:
+            continue
+        pref, opt = m.group(1), m.group(2)
+        if pref not in groups:
+            groups[pref] = []
+            order.append(pref)
+        groups[pref].append(opt)
+    return [(p, groups[p]) for p in order]
+
+
+def descriptor_variant(oid, links, extr, geodirs):
+    """Каталожный ID-вариант (FOS_BI_BODY_AA) -> (сцена под-части, exclude-regex, заметка).
+    Базовая деталь = длиннейший префикс ID, который ЕСТЬ в objectstable; остаток =
+    ГРУППА_ОПЦИИ. Всё из данных игры: REF базовой сцены -> под-сцена -> её дескриптор."""
+    toks = oid.split("_")
+    base, rest = None, []
+    for cut in range(len(toks) - 1, 0, -1):
+        cand = "_".join(toks[:cut])
+        if cand in links:
+            base, rest = cand, toks[cut:]
+            break
+    if not base or not rest:
+        return None
+    blink = links[base]
+    bscene = (blink.get("styles") or {}).get((blink.get("object") or {}).get("Style") or "None") \
+        or blink.get("scene")
+    if not bscene or extr is None:
+        return None
+    # Сцена базовой детали = СТЕНД со слотами (SLOT_BODY...); куски = отдельные сцены
+    # В ТОЙ ЖЕ ПАПКЕ с именем группы: FOS_BI_BODY_AA -> fossils/body.scene,
+    # FOS_BI_ARM_LEFT_A -> fossils/arm_left.scene. Точное имя в манифесте, без фуззи.
+    bdir = os.path.dirname(_norm(bscene))
+    sub, opt = None, ""
+    for cut2 in range(len(rest) - 1, 0, -1):
+        cand = bdir + "/" + "_".join(rest[:cut2]).lower() + ".scene.mbin"
+        if cand in extr.man:
+            sub, opt = cand, "".join(rest[cut2:])
+            break
+    if not sub:
+        return None
+    sfile = ensure_tree(sub, extr, geodirs)
+    dmx = _fetch_descriptor(sub, extr)
+    if not sfile or not dmx:
+        return None
+    groups = _descriptor_groups(dmx)
+    # короткий префикс = основная группа: '_BODY' (буква 1), '_BODYAACC' (буква 2)...
+    groups.sort(key=lambda g: len(g[0]))
+    exact_grp = next((p for p, opts in groups if opt in opts), None)  # напр. '_HEAD' c 'BA'
+    excl, note_sel = [], []
+    li = 0
+    for pref, opts in groups:
+        if exact_grp is not None:
+            want = opt if pref == exact_grp else "NULL"
+        else:
+            letter = opt[li] if li < len(opt) else "N"
+            want = next((o for o in opts if o != "NULL" and o[:1] == letter), "NULL")
+            li += 1
+        note_sel.append("%s=%s" % (pref, want))
+        for o in opts:
+            if o != want:
+                excl.append(re.escape(pref + "_" + o))
+    if not excl:
+        return None
+    regex = r"(?:%s)$" % "|".join(excl)
+    return sub, regex, "вариант по дескриптору игры: %s (%s)" % (os.path.basename(dmx), "; ".join(note_sel))
+
+
 # ------------------------------------------------------------------ ЕДИНОЕ ДРЕВО ДЕТАЛИ
 # Запрос юзера 07.07: при запекании группы вечно «не тот атлас или цвет» — программа
 # должна САМА безошибочно найти материалы/текстуры/цвета каждой детали из ПАКОВ и
@@ -576,9 +668,10 @@ def parse_material_local(mx):
     return out
 
 
-def collect_tree(scene_file, relax=False, depth=0, seen=None, prefix=""):
+def collect_tree(scene_file, relax=False, depth=0, seen=None, prefix="", extra=""):
     """[(путь_узла, материал_game_path, треугольники)] по LOD0 с REF-рекурсией."""
     skip_re = SKIPREF_RELAX if relax else SKIPREF
+    extra_rx = re.compile(extra, re.I) if extra else None
     if seen is None:
         seen = set()
     if scene_file in seen or depth > 6:
@@ -606,6 +699,8 @@ def collect_tree(scene_file, relax=False, depth=0, seen=None, prefix=""):
         if nm is None or tp is None:
             return
         name, typ = nm.get("value").split("|")[-1], tp.get("value")
+        if extra_rx and extra_rx.search(name):
+            return  # невыбранная опция дескриптора
         m = LODRE.search(name.lower())
         lod = int(m.group(1)) if m else lod_ctx
         aa = attrs_of(node)
@@ -617,7 +712,7 @@ def collect_tree(scene_file, relax=False, depth=0, seen=None, prefix=""):
             if sg and not skip_re.search((name + sg).lower()):
                 rf = resolve_scene_file(sg)
                 if rf:
-                    out.extend(collect_tree(rf, relax, depth + 1, seen, pfx + name + "/"))
+                    out.extend(collect_tree(rf, relax, depth + 1, seen, pfx + name + "/", extra))
         ch = P(node, "Children")
         if ch is not None:
             for c in ch.findall("Property"):
@@ -628,10 +723,10 @@ def collect_tree(scene_file, relax=False, depth=0, seen=None, prefix=""):
     return out
 
 
-def part_tree(oid, asset, scene_game, scene_file, relax, extr, obj_slots, index_dir):
+def part_tree(oid, asset, scene_game, scene_file, relax, extr, obj_slots, index_dir, exclude=""):
     """Единое дерево детали. Возвращает (tree, нет_материалов, нет_текстур)."""
     manifest = extr.man if extr else {}
-    nodes = collect_tree(scene_file, relax)
+    nodes = collect_tree(scene_file, relax, extra=exclude)
     mats, missing_mat, missing_tex = {}, [], []
     for _n, mp, _t in nodes:
         k = _norm(mp) if mp else ""
@@ -814,9 +909,35 @@ def render_preview(obj_path, icon_path, out_png, oid, size=384):
 
 # ------------------------------------------------------------------ сборка одной (подпроцесс)
 
-def build_one(scene_file, asset, staging, relax=False):
+def filter_scene_variant(scene_file, exclude_re, out_file):
+    """Копия сцены БЕЗ поддеревьев невыбранных опций дескриптора (узлы-LOCATOR
+    '_Body_B' и т.п. — их дети-меши имён опций не несут, режем целым поддеревом)."""
+    rx = re.compile(exclude_re, re.I)
+    tree = ET.parse(scene_file)
+
+    def prune(node):
+        ch = P(node, "Children")
+        if ch is None:
+            return
+        for c in list(ch.findall("Property")):
+            if c.get("value") != "TkSceneNodeData":
+                continue
+            nm = P(c, "Name")
+            name = nm.get("value").split("|")[-1] if nm is not None else ""
+            if rx.search(name):
+                ch.remove(c)
+            else:
+                prune(c)
+
+    prune(tree.getroot())
+    tree.write(out_file, encoding="utf-8")
+    return out_file
+
+
+def build_one(scene_file, asset, staging, relax=False, exclude=""):
     """Внутренний режим: conv2026 как модуль, OUTDIR -> staging.
     relax=True: снять фильтр snap-REF (комнаты spacebase из SnapGroup_*).
+    exclude: regex опций дескриптора — конвертеру отдаётся ОТФИЛЬТРОВАННАЯ копия сцены.
     Свою папку доизвлечения подкладываем конвертеру ПЕРВОЙ (только в этом
     процессе — глобальные списки conv2026 на диске не меняются)."""
     import conv2026 as cc
@@ -826,6 +947,9 @@ def build_one(scene_file, asset, staging, relax=False):
     cc.GEODIRS.insert(0, mw)
     if relax:
         cc.SKIPREF = SKIPREF_RELAX
+    if exclude:
+        scene_file = filter_scene_variant(scene_file, exclude,
+                                          os.path.join(staging, "_variant_" + asset + ".scene.MXML"))
     print(cc.build(scene_file, asset))
 
 
@@ -872,10 +996,13 @@ def main():
                     help="(внутреннее) собрать одну деталь")
     ap.add_argument("--relax-snap", action="store_true",
                     help="(внутреннее) не скипать SnapGroup-REF (комнаты spacebase)")
+    ap.add_argument("--exclude", default="",
+                    help="(внутреннее) regex невыбранных опций дескриптора")
     args = ap.parse_args()
 
     if args.build_one:
-        build_one(args.build_one[0], args.build_one[1], args.staging, args.relax_snap)
+        build_one(args.build_one[0], args.build_one[1], args.staging,
+                  args.relax_snap, args.exclude)
         return
 
     if not (args.group or args.ids or args.find or args.all):
@@ -924,7 +1051,8 @@ def main():
         group_name = "_поиск"
         print("Поиск «%s»: найдено %d деталей" % (args.find, len(parts)))
     elif args.all:
-        parts = [(p["ObjectID"].lstrip("^"), p) for p in db if p.get("bShowInDrawer", True)]
+        # ВСЕ детали каталога, включая скрытые из панели (запрос юзера 07.07: их 2434)
+        parts = [(p["ObjectID"].lstrip("^"), p) for p in db]
         group_name = "_ВСЕ_ДЕТАЛИ"
     else:
         parts = [(p["ObjectID"].lstrip("^"), p) for p in db
@@ -988,6 +1116,14 @@ def main():
                         rec["flags"].append("сцена из placement-entity игры (%s)" % pid2)
         if not scene_game and link:
             scene_game = link.get("scene")
+        exclude_re = ""
+        if not scene_game:
+            # ВАРИАНТ ПО ДЕСКРИПТОРУ ИГРЫ (фоссилы FOS_BI_BODY_AA и т.п.):
+            # базовая деталь -> REF-подсцена -> дескриптор -> комбинация опций
+            dv = descriptor_variant(oid, links, extr, geodirs)
+            if dv:
+                scene_game, exclude_re, vnote = dv
+                rec["flags"].append(vnote)
         if not scene_game and oid in SUBPART_SCENE:
             base = SUBPART_SCENE[oid]
             scene_game = next((k for k in scenes_dict if k.endswith("/" + base + ".scene.mbin")), None)
@@ -1032,6 +1168,8 @@ def main():
                        "--build-one", scene_f, asset, "--staging", staging]
                 if relax:
                     cmd.append("--relax-snap")
+                if exclude_re:
+                    cmd += ["--exclude", exclude_re]
                 cp = subprocess.run(cmd, capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=BUILD_TIMEOUT)
                 out["build"] = (cp.stdout or "").strip()[-200:]
@@ -1055,7 +1193,7 @@ def main():
 
             creds = []  # расхождения СО СЦЕНОЙ (смягчаются при совпадении с принятым мешом)
             # 1) треугольники vs сцена игры
-            tris_game, mats_game = scene_lod0(scene_f, relax=relax)
+            tris_game, mats_game = scene_lod0(scene_f, relax=relax, extra=exclude_re)
             out["tris"] = {"obj": len(tris_obj), "game": tris_game}
             if tris_game and abs(len(tris_obj) - tris_game) > max(4, tris_game * 0.02):
                 creds.append("ТРЕУГ: obj %d vs игра %d" % (len(tris_obj), tris_game))
@@ -1141,7 +1279,7 @@ def main():
         try:
             tree, miss_m, miss_t = part_tree(oid, asset, scene_game or "", scene_file,
                                              relax_used, extr, rec.get("slots", {}).get("obj"),
-                                             args.index)
+                                             args.index, exclude_re)
             with open(os.path.join(trees_dir, oid + ".json"), "w", encoding="utf-8") as fh:
                 json.dump(tree, fh, ensure_ascii=False, indent=1)
             with open(os.path.join(trees_dir, oid + ".txt"), "w", encoding="utf-8") as fh:
