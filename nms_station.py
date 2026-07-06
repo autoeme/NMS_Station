@@ -29,6 +29,13 @@ INDEXER = os.path.join(HERE, "nms_indexer.py")
 LOOKUP = os.path.join(HERE, "nms_lookup.py")
 ICONS_PNG = r"C:\Users\User\Desktop\NMS_EXTRACT\ИКОНКИ_PNG"
 
+# СТАНЦИЯ МЕШЕЙ (объединена сюда по команде юзера 06.07.2026): движок nms_meshwork.py.
+# Раздел показывается только там, где есть движок и каталог проекта (машина разработки).
+MESHWORK = os.path.join(HERE, "nms_meshwork.py")
+PARTS_DB = r"C:\Users\User\Documents\Unreal Projects\NMS_BuilderApp\Content\nms_parts_db.json"
+MESH_STAGING = r"C:\Users\User\Desktop\MESHWORK_STAGING"
+HAS_MESHWORK = os.path.isfile(MESHWORK) and os.path.isfile(PARTS_DB)
+
 # признак машины разработки: есть локальные дампы. У друзей — портативные пути рядом с exe.
 DEV_MBIN = r"C:\Users\User\Desktop\MBINCompiler\MBINCompiler.exe"
 DEV_OBJECTSTABLE = (r"C:\Users\User\Desktop\MBINCompiler\PRECACHE_FULL"
@@ -85,6 +92,10 @@ T = {
  "pp_mat": "  Материал %s  Class=%s", "pp_flags": "    Флаги: %s",
  "pp_hull": "Габарит (%s): %.2f x %.2f x %.2f м",
  "pp_icon_dds": "Иконка DDS: %s", "pp_icon_png": "Иконка PNG: %s",
+ "mesh_row": "МЕШИ — группа:", "mesh_group_all": "— ВСЕ ДЕТАЛИ —",
+ "mesh_find": "или ObjectID/имя:", "mesh_run": "СОБРАТЬ И ПРОВЕРИТЬ",
+ "mesh_preview": "превью", "mesh_open_prev": "Превью-картинки", "mesh_open_rep": "Отчёт мешей",
+ "task_mesh": "Сборка и проверка мешей: %s", "mesh_need": "!! Выбери группу мешей или впиши ObjectID/имя.",
 },
 "en": {
  "title": "NMS Station — parts indexer & passport",
@@ -120,6 +131,10 @@ T = {
  "pp_mat": "  Material %s  Class=%s", "pp_flags": "    Flags: %s",
  "pp_hull": "Bounds (%s): %.2f x %.2f x %.2f m",
  "pp_icon_dds": "Icon DDS: %s", "pp_icon_png": "Icon PNG: %s",
+ "mesh_row": "MESHES — group:", "mesh_group_all": "— ALL PARTS —",
+ "mesh_find": "or ObjectID/name:", "mesh_run": "BUILD & VERIFY",
+ "mesh_preview": "previews", "mesh_open_prev": "Preview images", "mesh_open_rep": "Mesh report",
+ "task_mesh": "Building & verifying meshes: %s", "mesh_need": "!! Pick a mesh group or enter an ObjectID/name.",
 },
 "de": {
  "title": "NMS Station — Teile-Indexer & Steckbrief",
@@ -332,6 +347,34 @@ class Station(tk.Tk):
         self._reg(ttk.Button(row, command=lambda: self.text.delete("1.0", "end")),
                   "clear").pack(side="right", padx=4)
 
+        # --- ряд МЕШЕЙ (СТАНЦИЯ МЕШЕЙ, только на машине разработки)
+        self.btn_mesh = None
+        if HAS_MESHWORK:
+            mrow = ttk.Frame(self)
+            mrow.pack(fill="x", **pad)
+            self._reg(ttk.Label(mrow), "mesh_row").pack(side="left")
+            self.var_mgroup = tk.StringVar(value="")
+            ttk.Combobox(mrow, textvariable=self.var_mgroup, width=22, state="readonly",
+                         values=[self.t("mesh_group_all")] + self._mesh_groups()
+                         ).pack(side="left", padx=(4, 8))
+            self._reg(ttk.Label(mrow), "mesh_find").pack(side="left")
+            self.var_mfind = tk.StringVar(value="")
+            me = ttk.Entry(mrow, textvariable=self.var_mfind, width=18)
+            me.pack(side="left", padx=(2, 6))
+            me.bind("<Return>", lambda _ev: self.run_meshwork())
+            self._reg(ttk.Label(mrow), "limit").pack(side="left")
+            self.var_mlimit = tk.StringVar(value="")
+            ttk.Entry(mrow, textvariable=self.var_mlimit, width=6).pack(side="left")
+            self.var_mprev = tk.BooleanVar(value=True)
+            self._reg(ttk.Checkbutton(mrow, variable=self.var_mprev), "mesh_preview").pack(
+                side="left", padx=6)
+            self.btn_mesh = self._reg(ttk.Button(mrow, command=self.run_meshwork), "mesh_run")
+            self.btn_mesh.pack(side="left", padx=(0, 8))
+            self._reg(ttk.Button(mrow, command=lambda: self._open_mesh("preview")),
+                      "mesh_open_prev").pack(side="left")
+            self._reg(ttk.Button(mrow, command=lambda: self._open_mesh("ОТЧЁТ.txt")),
+                      "mesh_open_rep").pack(side="left", padx=4)
+
         # нижняя часть: слева окно результата, справа галерея; между ними —
         # ПЕРЕТАСКИВАЕМЫЙ разделитель (PanedWindow), ширины окон меняются мышью
         self.paned = ttk.PanedWindow(self, orient="horizontal")
@@ -468,7 +511,7 @@ class Station(tk.Tk):
         из .exe — тот же exe с флагом-маршрутом (--run-indexer/--run-lookup)."""
         if FROZEN:
             return [sys.executable, "--run-" + kind] + args
-        script = INDEXER if kind == "indexer" else LOOKUP
+        script = {"indexer": INDEXER, "lookup": LOOKUP, "meshwork": MESHWORK}[kind]
         return [sys.executable, script] + args
 
     def _start(self, argv, title):
@@ -491,6 +534,8 @@ class Station(tk.Tk):
         self.prog.start(80)
         self.btn_index.configure(state="disabled")
         self.btn_lookup.configure(state="disabled")
+        if self.btn_mesh is not None:
+            self.btn_mesh.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         threading.Thread(target=self._reader, daemon=True).start()
 
@@ -512,6 +557,8 @@ class Station(tk.Tk):
                     self.status.set(self.t("ready"))
                     self.btn_index.configure(state="normal")
                     self.btn_lookup.configure(state="normal")
+                    if self.btn_mesh is not None:
+                        self.btn_mesh.configure(state="normal")
                     self.btn_stop.configure(state="disabled")
                     if self._last_task == "index":
                         self._parts_links = None   # база обновилась — перечитать
@@ -756,6 +803,58 @@ class Station(tk.Tk):
             L.append(self.t("pp_icon_png") % rec["icon"]["png"])
         self.log("\n".join(L) + "\n")
 
+    # ------------------------------------------------------------ меши
+    def _mesh_groups(self):
+        try:
+            with open(PARTS_DB, encoding="utf-8") as fh:
+                db = json.load(fh)
+            seen = []
+            for p in db:   # порядок групп = порядок появления в каталоге (панель ДЕТАЛИ)
+                c = p.get("Category")
+                if c and c not in seen:
+                    seen.append(c)
+            return seen
+        except Exception:
+            return []
+
+    def _mesh_dir(self):
+        g = self.var_mgroup.get().strip()
+        if self.var_mfind.get().strip():
+            name = "_поиск"
+        elif g == self.t("mesh_group_all"):
+            name = "_ВСЕ_ДЕТАЛИ"
+        else:
+            name = g or "_поиск"
+        return os.path.join(MESH_STAGING, name.replace("/", "_"))
+
+    def _open_mesh(self, sub):
+        p = os.path.join(self._mesh_dir(), sub) if sub else self._mesh_dir()
+        if os.path.exists(p):
+            os.startfile(p)
+        else:
+            self.log("\n" + self.t("no_outdir") % p + "\n")
+
+    def run_meshwork(self):
+        find = self.var_mfind.get().strip()
+        g = self.var_mgroup.get().strip()
+        args = ["--index", self.var_out.get().strip(), "--mbin", self.var_mbin.get().strip()]
+        if find:
+            args += ["--find", find]
+        elif g == self.t("mesh_group_all"):
+            args.append("--all")
+        elif g:
+            args += ["--group", g]
+        else:
+            self.log("\n" + self.t("mesh_need") + "\n")
+            return
+        lim = self.var_mlimit.get().strip()
+        if lim.isdigit() and int(lim) > 0:
+            args += ["--limit", lim]
+        if not self.var_mprev.get():
+            args.append("--no-preview")
+        self._last_task = "mesh"
+        self._start(self._child_argv("meshwork", args), self.t("task_mesh") % (find or g))
+
     def stop(self):
         if self.proc is not None:
             try:
@@ -781,6 +880,11 @@ def main():
         sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != "--run-lookup"]
         import nms_lookup
         nms_lookup.main()
+        return
+    if "--run-meshwork" in sys.argv:
+        sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != "--run-meshwork"]
+        import nms_meshwork
+        nms_meshwork.main()
         return
     if "--selftest" in sys.argv:
         app = Station()

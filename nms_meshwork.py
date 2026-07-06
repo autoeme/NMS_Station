@@ -1,0 +1,965 @@
+# -*- coding: utf-8 -*-
+"""
+nms_meshwork.py — «СТАНЦИЯ МЕШЕЙ»: автосборка мешей группы + автопроверки + превью.
+
+Схема (одобрена юзером 06.07.2026, заметка в memory/nms-lookup-tool):
+  вход = группа каталога (или список ObjectID) + NMS_INDEX\\parts_links.json
+  -> для каждой детали: conv2026.build(сцена, ассет) — конвертер зовётся КАК МОДУЛЬ
+     (не форкается), OBJ пишется в STAGING-папку (НЕ в MeshSrc!)
+  -> автопроверки: bbox OBJ vs хулл MagicData (оси NMS: X=ox/100, Y=oz/100, Z=-oy/100),
+     треугольники vs сцена игры (BATCHCOUNT LOD0 с наследованием LOD-контекста),
+     слоты usemtl vs материалы сцены
+  -> рендер-превью OBJ рядом с иконкой игры (сравнение глазом)
+  -> отчёт зелёные/жёлтые/красные + import_list.json (только зелёные).
+
+ПРЕДОХРАНИТЕЛИ:
+  - ПРОВЕРКА идёт по ВСЕМ деталям (staging никому не вредит, а запечённые полезно
+    регресс-проверять после обновлений игры);
+  - в MeshSrc ничего не пишется без ЯВНОГО --promote (копирует зелёные OBJ + пишет
+    stage2_import_list.json для Content/Python/reimport_stage2.py); при promote
+    запечённые (verified_meshes.json) защищены — перезапись только с --force-verified;
+  - детали, собранные в проекте ВРУЧНУЮ по решению юзера (ворота GDOOR открытые),
+    проверяются, но всегда ЖЁЛТЫЕ с пометкой «не продвигать»;
+  - патологические меши (виснущие стопки вариантов) собираются с таймаутом в подпроцессе.
+Автоматика глаз НЕ заменяет: итог всегда «посмотри превью» (папка preview рядом с отчётом).
+
+САМА ДОИЗВЛЕКАЕТ недостающее из паков (06.07.2026): если точной сцены или ТОЧНОЙ
+СТИЛЕВОЙ геометрии (ловушка GDOOR: стили делят короткое имя basic_ramp.geometry!)
+нет в локальных дампах — достаёт из PCBANKS по pak_manifest.json и декодирует
+MBINCompiler'ом в NEW_EXTRACT_2026 (точное __-имя выигрывает у фолбэков conv2026).
+
+Использование:
+    python nms_meshwork.py --group "Legacy Structures" [--limit N]
+    python nms_meshwork.py --ids TELEPORTER,WALL      (точные ObjectID)
+    python nms_meshwork.py --find стена,WALL          (поиск по ObjectID/имени)
+    python nms_meshwork.py --all                      (ВСЕ детали каталога)
+    ... [--staging DIR] [--index DIR] [--no-preview] [--force-verified] [--promote]
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+PROJ = r"C:\Users\User\Documents\Unreal Projects\NMS_BuilderApp"
+DEF_INDEX = r"C:\Users\User\Desktop\NMS_INDEX"
+DEF_STAGING = r"C:\Users\User\Desktop\MESHWORK_STAGING"
+DEF_MBIN = r"C:\Users\User\Desktop\MBINCompiler\MBINCompiler.exe"
+SC = r"C:\Users\User\Desktop\NMS_EXTRACT\SCENES_PARTS_NEW"
+NE = r"C:\Users\User\Desktop\MBINCompiler\NEW_EXTRACT_2026"
+ICONS_DIRS = [os.path.join(DEF_INDEX, "icons"),
+              r"C:\Users\User\Desktop\NMS_EXTRACT\ИКОНКИ_PNG"]
+
+BUILD_TIMEOUT = 600      # сек на одну деталь (виснущие стопки вариантов)
+GIANT_MB = 40            # OBJ больше — «гигант», превью пропускаем (Правило 2/13)
+# известные виснущие меши (корвет-стопки вариантов, quadratic weld) — скип с пометкой
+PATHOLOGICAL = {"landinggear_leg_c", "module_generators", "module_pumps", "vehiclegaragemech"}
+
+# собраны ВРУЧНУЮ по решению юзера — автоматом НЕ пересобирать (пересборка по сцене
+# даст «правильный», но НЕ ЖЕЛАЕМЫЙ меш; см. memory/group-by-group-mesh-qc, коммит 857b848c)
+CUSTOM_BUILT = {
+    "W_GDOOR": "ворота собраны ОТКРЫТЫМИ без полотна (решение юзера 06.07)",
+    "M_GDOOR": "ворота собраны ОТКРЫТЫМИ без полотна (решение юзера 06.07)",
+    "C_GDOOR": "ворота собраны ОТКРЫТЫМИ без полотна (решение юзера 06.07)",
+}
+# легаси-ID, которых нет в objectstable: авторитетные меши подтверждены юзером 01.07.2026
+# (memory/part-mesh-icon-rule18); ALIAS = «тот же меш, что у...», SUBPART = сцена под-части
+ALIAS_PART = {"CORRIDOR_S": "CORRIDOR_SPACE"}          # дубликат corridor_straight
+SUBPART_SCENE = {"CORRIDOR_WINDOW": "corridor_windowframe",
+                 "CUBEWALL_SPACE": "cuberoom_innerwall"}
+
+LODRE = re.compile(r"lod(\d)", re.I)
+SKIPNAME = re.compile(r"shadow|collision|waterproxy|_proxy|wallbb", re.I)
+SKIPREF = re.compile(r"snap|shadow|collision|_proxy|refwall\b", re.I)
+# «мягкий» фильтр для комнат spacebase: их содержимое = SnapGroup_*-REFERENCE'ы
+# (cuberoom_a: стены/углы/пол/люки — ВСЕ через SnapGroup; прецедент — relaxed
+# snap-REF добор в легаси-текстурном пассе). Применяется ТОЛЬКО как повтор при ПУСТО.
+SKIPREF_RELAX = re.compile(r"shadow|collision|_proxy|refwall\b", re.I)
+
+
+# ------------------------------------------------------------------ разрешение сцены
+# (копия резолвера из audit_group_scenes.py — свои файлы, не правим)
+
+def resolve_scene_file(game_path):
+    p = game_path.replace("/", "\\").lower().replace(".scene.mbin", "")
+    p = re.sub(r"_placement$", "", p)
+    full = p.replace("\\", "__") + ".scene.MXML"
+    wo = re.sub(r"^models__", "", full)
+    for d, fn in ((NE, full), (SC, full), (SC, wo)):
+        f = os.path.join(d, fn)
+        if os.path.isfile(f):
+            return f
+    import glob
+    base = p.split("\\")[-1]
+    c = glob.glob(os.path.join(SC, "*__" + base + ".scene.MXML")) + \
+        glob.glob(os.path.join(SC, base + ".scene.MXML")) + \
+        glob.glob(os.path.join(NE, "*__" + base + ".scene.MXML"))
+    return max(c, key=os.path.getsize) if c else None
+
+
+# ------------------------------------------------------------------ доизвлечение из паков
+# Если ТОЧНОГО локального файла нет — достаём из PCBANKS (pak_manifest) и декодируем
+# в NEW_EXTRACT_2026 с полным __-именем: у conv2026 точное имя выигрывает у фолбэков
+# (лечит ловушку стилей: один basic_ramp.geometry на 7 стилей). HGPak — из nms_finish.
+
+class Extractor(object):
+    def __init__(self, pcbanks, manifest, mbin_exe):
+        self.pcbanks, self.man, self.mbin = pcbanks, manifest, mbin_exe
+        self.paks = {}
+        self.n_extracted = 0
+
+    def raw(self, key):
+        rec = self.man.get(key)
+        if rec is None:
+            return None
+        if rec["pak"] not in self.paks:
+            from nms_finish import HGPak
+            self.paks[rec["pak"]] = HGPak(os.path.join(self.pcbanks, rec["pak"]))
+        return self.paks[rec["pak"]].extract(rec["index"])
+
+    def fetch_decode(self, key, dst_mbin):
+        """извлечь key из паков в dst_mbin и декодировать; вернуть путь MXML или None."""
+        mx = re.sub(r"\.mbin(\.pc)?$", ".MXML", dst_mbin, flags=re.I)
+        if os.path.isfile(mx):
+            return mx
+        if not os.path.isfile(dst_mbin):
+            data = self.raw(key)
+            if data is None:
+                return None
+            with open(dst_mbin, "wb") as fh:
+                fh.write(data)
+        subprocess.run([self.mbin, "-y", "-q", dst_mbin], capture_output=True, timeout=600)
+        if os.path.isfile(mx):
+            self.n_extracted += 1
+            return mx
+        return None
+
+
+def _norm(p):
+    return p.replace("\\", "/").lower()
+
+
+def _flat(p_norm):
+    return p_norm.replace("/", "__")
+
+
+def exact_scene_local(game_path):
+    """Точный локальный файл сцены (полное имя, без глоб-фолбэков)."""
+    p = re.sub(r"_placement$", "", _norm(game_path).replace(".scene.mbin", ""))
+    full = _flat(p) + ".scene.MXML"
+    wo = re.sub(r"^models__", "", full)
+    for d, fn in ((NE, full), (SC, full), (SC, wo)):
+        f = os.path.join(d, fn)
+        if os.path.isfile(f):
+            return f
+    return None
+
+
+def exact_geo_exists(geom_attr, geodirs):
+    p = re.sub(r"\.geometry(\.mbin)?(\.pc)?$", "", _norm(geom_attr))
+    full = _flat(p) + ".geometry.data.MXML"
+    wo = re.sub(r"^models__", "", full)
+    for gd in geodirs:
+        for fn in (full, wo):
+            f = os.path.join(gd, fn)
+            if os.path.isfile(f) and os.path.getsize(f) > 500:
+                return True
+    return False
+
+
+_ENSURED = {}
+_FORCED = set()
+
+def ensure_tree(game_scene, extr, geodirs, depth=0, force_geo=False):
+    """Гарантирует точные локальные файлы: сцена (+ _placement-подложка),
+    её geometry.data и рекурсивно все REFERENCE-сцены. Возвращает файл сцены.
+    force_geo=True: дополнительно кладёт СВЕЖУЮ geometry.data из паков в
+    NEW_EXTRACT_2026, даже если точный файл есть в старых дампах (лечит
+    устаревшие дампы: в GEO2 телепорт без portalscroll)."""
+    key = _norm(game_scene)
+    if depth > 6:
+        return _ENSURED.get(key)
+    if key in _ENSURED and (not force_geo or key in _FORCED):
+        return _ENSURED.get(key)
+    if force_geo:
+        _FORCED.add(key)
+    sf = exact_scene_local(game_scene)
+    if sf is None and extr is not None:
+        # базовая сцена (без _placement) из паков
+        p = re.sub(r"_placement$", "", key.replace(".scene.mbin", ""))
+        sf = extr.fetch_decode(p + ".scene.mbin", os.path.join(NE, _flat(p) + ".scene.mbin"))
+    if sf is None:
+        # нестрогий поиск по дампам (короткие имена SCENES_PARTS_NEW) —
+        # РАНЬШЕ извлечения placement: placement часто пустая обёртка (RefWall+локатор)
+        sf = resolve_scene_file(game_scene)
+    if sf is None and extr is not None:
+        sf = extr.fetch_decode(key, os.path.join(NE, _flat(key.replace(".scene.mbin", "")) + ".scene.mbin"))
+    _ENSURED[key] = sf
+    if sf is None:
+        return None
+    # геометрия этой сцены + рекурсия по REF (как в conv2026: скипы те же)
+    try:
+        root = ET.parse(sf).getroot()
+    except ET.ParseError:
+        return sf
+
+    def rec(node):
+        aa = {}
+        a = P(node, "Attributes")
+        if a is not None:
+            for c in a.findall("Property"):
+                if c.get("value") == "TkSceneNodeAttributeData":
+                    nm, val = P(c, "Name"), P(c, "Value")
+                    if nm is not None and val is not None:
+                        aa[nm.get("value")] = val.get("value")
+        g = aa.get("GEOMETRY")
+        if g and extr is not None:
+            p = re.sub(r"\.geometry(\.mbin)?(\.pc)?$", "", _norm(g))
+            ne_mx = os.path.join(NE, _flat(p) + ".geometry.data.MXML")
+            need = (not exact_geo_exists(g, geodirs)) or (force_geo and not os.path.isfile(ne_mx))
+            if need:
+                for cand in (p + ".geometry.data.mbin.pc", p + ".geometry.data.mbin"):
+                    if extr.fetch_decode(cand, os.path.join(NE, _flat(p) + ".geometry.data.mbin")):
+                        break
+        sg = aa.get("SCENEGRAPH")
+        nm = P(node, "Name")
+        name = nm.get("value").split("|")[-1] if nm is not None else ""
+        if sg and not SKIPREF.search((name + sg).lower()):
+            ensure_tree(sg, extr, geodirs, depth + 1, force_geo)
+        ch = P(node, "Children")
+        if ch is not None:
+            for c in ch.findall("Property"):
+                if c.get("value") == "TkSceneNodeData":
+                    rec(c)
+
+    rec(root)
+    return sf
+
+
+# ------------------------------------------------------------------ эталон из сцены
+# треугольники LOD0 + материалы (BATCHCOUNT, наследование LOD-контекста, рекурсия REF)
+
+def P(el, name):
+    for c in el.findall("Property"):
+        if c.get("name") == name:
+            return c
+    return None
+
+
+def scene_lod0(scene_file, depth=0, seen=None, relax=False):
+    skip_re = SKIPREF_RELAX if relax else SKIPREF
+    if seen is None:
+        seen = set()
+    if scene_file in seen or depth > 6:
+        return 0, []
+    seen.add(scene_file)
+    try:
+        root = ET.parse(scene_file).getroot()
+    except ET.ParseError:
+        return 0, []
+    tris, mats = 0, []
+
+    def attrs_of(node):
+        out = {}
+        a = P(node, "Attributes")
+        if a is None:
+            return out
+        for c in a.findall("Property"):
+            if c.get("value") == "TkSceneNodeAttributeData":
+                nm, val = P(c, "Name"), P(c, "Value")
+                if nm is not None and val is not None:
+                    out[nm.get("value")] = val.get("value")
+        return out
+
+    def rec(node, lod_ctx):
+        nonlocal tris
+        nm, tp = P(node, "Name"), P(node, "Type")
+        if nm is None or tp is None:
+            return
+        name, typ = nm.get("value").split("|")[-1], tp.get("value")
+        m = LODRE.search(name.lower())
+        lod = int(m.group(1)) if m else lod_ctx
+        aa = attrs_of(node)
+        if typ == "MESH" and not SKIPNAME.search(name.lower()) and (lod is None or lod == 0):
+            tris += int(aa.get("BATCHCOUNT", 0) or 0) // 3
+            mat = os.path.basename(aa.get("MATERIAL", "")).split(".")[0].lower()
+            if mat and mat not in mats:
+                mats.append(mat)
+        elif typ == "REFERENCE" and (lod is None or lod == 0):
+            sg = aa.get("SCENEGRAPH", "")
+            if sg and not skip_re.search((name + sg).lower()):
+                rf = resolve_scene_file(sg)
+                if rf:
+                    t2, m2 = scene_lod0(rf, depth + 1, seen, relax)
+                    tris += t2
+                    for x in m2:
+                        if x not in mats:
+                            mats.append(x)
+        ch = P(node, "Children")
+        if ch is not None:
+            for c in ch.findall("Property"):
+                if c.get("value") == "TkSceneNodeData":
+                    rec(c, lod)
+
+    rec(root, None)
+    return tris, mats
+
+
+# ------------------------------------------------------------------ разбор OBJ
+
+def parse_obj(path):
+    """-> (verts Nx3 list, tris список индексных троек, [usemtl], bbox (min,max))."""
+    verts, tris, mats = [], [], []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("v "):
+                p = line.split()
+                verts.append((float(p[1]), float(p[2]), float(p[3])))
+            elif line.startswith("f "):
+                idx = [int(t.split("/")[0]) - 1 for t in line.split()[1:4]]
+                tris.append(tuple(idx))
+            elif line.startswith("usemtl "):
+                m = line.split(None, 1)[1].strip()
+                if m not in mats:
+                    mats.append(m)
+    if not verts:
+        return None
+    xs = [v[0] for v in verts]; ys = [v[1] for v in verts]; zs = [v[2] for v in verts]
+    bbox = ((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
+    return verts, tris, mats, bbox
+
+
+def obj_bbox_to_nms(bbox):
+    """OBJ-кадр конвертера = (x, -z, y)*100 -> оси NMS в метрах:
+    X = ox/100, Y = oz/100, Z = -oy/100 (минус меняет местами min/max по Z)."""
+    (x0, y0, z0), (x1, y1, z1) = bbox
+    mn = (x0 / 100.0, z0 / 100.0, -y1 / 100.0)
+    mx = (x1 / 100.0, z1 / 100.0, -y0 / 100.0)
+    size = tuple(round(b - a, 4) for a, b in zip(mn, mx))
+    return mn, mx, size
+
+
+def hull_check(size_obj, hull):
+    """Сверка габарита с хуллом MagicData. ВАЖНО (калибровка 06.07.2026 на C_RAMP):
+    автогенерированный хулл игры идёт С ЗАПАСОМ (меш 5.53 м при хулле 6.24 м у
+    ПРИНЯТОГО юзером меша) — поэтому «меньше хулла» = КРАСН только при большой
+    недостаче (потеря кусков), лёгкая недостача = ЖЁЛТ; заметно шире = ЖЁЛТ
+    (голо/glow-квады — норма для проекций)."""
+    size_h = hull["size"]
+    flags_red, flags_yellow = [], []
+    for ax in range(3):
+        so, sh = size_obj[ax], size_h[ax]
+        tol_red = max(1.0, sh * 0.20)
+        tol_yel = max(0.35, sh * 0.10)
+        tol_big = max(0.5, sh * 0.15)
+        if so < sh - tol_red:
+            flags_red.append("%s: %0.2f м << хулл %0.2f м (потеря кусков?)" % ("XYZ"[ax], so, sh))
+        elif so < sh - tol_yel:
+            flags_yellow.append("%s: %0.2f м < хулл %0.2f м (глянуть глазом)" % ("XYZ"[ax], so, sh))
+        elif so > sh + tol_big:
+            flags_yellow.append("%s: %0.2f м > хулл %0.2f м (голо/glow?)" % ("XYZ"[ax], so, sh))
+    return flags_red, flags_yellow
+
+
+def project_match(asset, parsed):
+    """Свежая сборка == OBJ в MeshSrc проекта (число вершин/граней + bbox)?
+    Совпадение с уже ПРИНЯТЫМ мешом — сильный признак правильности."""
+    f = os.path.join(PROJ, "MeshSrc", asset + ".obj")
+    try:
+        if not os.path.isfile(f) or os.path.getsize(f) > GIANT_MB * 1048576:
+            return False
+    except OSError:
+        return False
+    p2 = parse_obj(f)
+    if not p2:
+        return False
+    v1, t1, _m1, b1 = parsed
+    v2, t2, _m2, b2 = p2
+    if len(v1) != len(v2) or len(t1) != len(t2):
+        return False
+    return all(abs(a - b) < 0.01 for pa, pb in zip(b1, b2) for a, b in zip(pa, pb))
+
+
+# ------------------------------------------------------------------ игровая цепочка
+# placement-entity (НАЙДЕНО 06.07.2026, принцип юзера «знания даёт ИГРА, не каталог»):
+# placement-сцена -> LOCATOR ATTACHMENT -> *.ENTITY.MBIN -> GcBasePlacementComponentData
+# .Rules[] -> правило NotSnapped (дефолтный вид одиночной детали) -> PartID ->
+# partstable[PartID][стиль] -> сцена. Пример: C_DOORWINDOW -> _DOORWINB0 ->
+# MESHES/CONCRETE/BASIC_WALL_DOORWINDOWL; авто-двери = правило IsSnapped -> _DOORB0.
+
+_PARTSTABLE = None
+
+def load_partstable(index_dir):
+    """Полный partstable {ID: {стиль: сцена}} из raw индексатора (стриминг-копия)."""
+    global _PARTSTABLE
+    if _PARTSTABLE is not None:
+        return _PARTSTABLE
+    _PARTSTABLE = {}
+    mxml = os.path.join(index_dir, "raw", "metadata", "reality", "tables",
+                        "basebuildingpartstable.MXML")
+    if not os.path.isfile(mxml):
+        return _PARTSTABLE
+    opener = '\t\t<Property name="Parts"'
+    with open(mxml, encoding="utf-8", errors="replace") as fh:
+        head = fh.read(4096)
+    if 'name="Parts"' not in head:
+        opener = '\t\t<Property name="Table"'
+    entry, inside = [], False
+    style_re = re.compile(
+        r'name="Style" value="([^"]+)" />\s*\n\s*</Property>\s*\n\s*'
+        r'<Property name="Model" value="TkModelResource">\s*\n\s*'
+        r'<Property name="Filename" value="([^"]*)"')
+    close_line = "\t\t</Property>"
+    with open(mxml, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            ls = line.rstrip("\n")
+            if ls.startswith(opener):
+                entry, inside = [ls], True
+                continue
+            if inside:
+                entry.append(ls)
+                if ls == close_line:
+                    e = "\n".join(entry)
+                    m = re.search(r'<Property name="ID" value="([^"]+)"', e)
+                    if m:
+                        _PARTSTABLE[m.group(1)] = {s: f for s, f in style_re.findall(e) if f}
+                    inside = False
+    return _PARTSTABLE
+
+
+def ensure_exact_scene(game_path, extr):
+    """Точный локальный файл сцены БЕЗ среза _placement (для чтения entity самой
+    placement-сцены); нет локально — извлечь из паков."""
+    p = _norm(game_path).replace(".scene.mbin", "")
+    full = _flat(p) + ".scene.MXML"
+    wo = re.sub(r"^models__", "", full)
+    for d, fn in ((NE, full), (SC, full), (SC, wo)):
+        f = os.path.join(d, fn)
+        if os.path.isfile(f):
+            return f
+    if extr is not None:
+        return extr.fetch_decode(p + ".scene.mbin", os.path.join(NE, _flat(p) + ".scene.mbin"))
+    return None
+
+
+def placement_entity_partid(placement_path, extr):
+    """PartID дефолтного (NotSnapped) правила из entity placement-сцены, иначе None."""
+    sf = ensure_exact_scene(placement_path, extr)
+    if not sf:
+        return None
+    try:
+        txt = open(sf, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    att = re.findall(r'name="Name" value="ATTACHMENT" />\s*\n\s*'
+                     r'<Property name="Value" value="([^"]+\.ENTITY\.MBIN)"', txt, re.I)
+    if not att:
+        return None
+    ent_key = _norm(att[0])
+    mx = None
+    if extr is not None:
+        mx = extr.fetch_decode(ent_key, os.path.join(NE, _flat(ent_key.replace(".entity.mbin", "")) + ".entity.mbin"))
+    if not mx:
+        return None
+    etxt = open(mx, encoding="utf-8", errors="replace").read()
+    first_pid = None
+    for block in re.split(r'value="GcBasePlacementRule"', etxt)[1:]:
+        pm = re.search(r'<Property name="PartID" value="([^"]+)"', block)
+        if not pm:
+            continue
+        if first_pid is None:
+            first_pid = pm.group(1)
+        states = re.findall(r'<Property name="SnapState" value="(NotSnapped|IsSnapped)"', block)
+        if states and all(s == "NotSnapped" for s in states):
+            return pm.group(1)  # дефолтное состояние одиночной детали
+    return first_pid
+
+
+def alt_scene_candidates(asset, primary, extr, geodirs):
+    """Запасные сцены при ПУСТО: сцена, названная ТОЧНО по имени ассета проекта
+    (пример: BRIDGECONNECTOR -> меш cubesolid, юзер подтвердил 01.07.2026) —
+    сперва из паков, затем из локальных дампов. Только точные имена, без фуззи."""
+    import glob as _g
+    a = asset.lower()
+    seen = {primary}
+    out = []
+    if extr is not None:
+        for k in extr.man:
+            if k.endswith("/" + a + ".scene.mbin"):
+                f = ensure_tree(k, extr, geodirs)
+                if f and f not in seen:
+                    out.append((f, "по имени ассета из паков"))
+                    seen.add(f)
+    for d in (NE, SC):
+        for fn in (_g.glob(os.path.join(d, "*__" + a + ".scene.MXML")) +
+                   _g.glob(os.path.join(d, a + ".scene.MXML"))):
+            if fn not in seen:
+                out.append((fn, "по имени ассета из дампов"))
+                seen.add(fn)
+    return out[:3]
+
+
+STYLE_DIRS = ("wood", "stone", "timber", "metal", "concrete", "fibreglass", "builders")
+
+
+def asset_styled_scene(asset, manifest):
+    """Легаси-стилевые формы: имя ассета проекта = '<стиль>_<база>' -> сцена
+    meshes/<стиль>/<база>.scene.mbin (ТОЧНЫЙ путь в манифесте паков, без фуззи;
+    подтверждено аудитом путей 06.07.2026: 'сцена meshes/<стиль>/<база> существует -> OK')."""
+    if manifest is None:
+        return None
+    m = re.match(r"^(%s)_(.+)$" % "|".join(STYLE_DIRS), asset.lower())
+    if not m:
+        return None
+    suff = "/meshes/%s/%s.scene.mbin" % (m.group(1), m.group(2))
+    for k in manifest:
+        if k.endswith(suff):
+            return k
+    return None
+
+
+# ------------------------------------------------------------------ превью (PIL, свой рендер)
+
+def render_preview(obj_path, icon_path, out_png, oid, size=384):
+    """Софт-рендер OBJ (ортопроекция 3/4, покраска по нормали) рядом с иконкой игры."""
+    import math
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    parsed = parse_obj(obj_path)
+    if not parsed:
+        return False
+    verts, tris, _mats, _bbox = parsed
+    v = np.asarray(verts, dtype=np.float32)
+    t = np.asarray(tris, dtype=np.int64)
+    if len(t) == 0:
+        return False
+    # центрирование и вписывание
+    c = (v.min(0) + v.max(0)) / 2.0
+    v = v - c
+    r = float(np.abs(v).max()) or 1.0
+    v = v / r
+    # поворот: yaw -35°, pitch -22° (стандартный 3/4 вид); экран: x=vx, y=-vz, глубина=vy
+    ya, pa = math.radians(-35), math.radians(-22)
+    Ry = np.array([[math.cos(ya), 0, math.sin(ya)], [0, 1, 0], [-math.sin(ya), 0, math.cos(ya)]])
+    Rx = np.array([[1, 0, 0], [0, math.cos(pa), -math.sin(pa)], [0, math.sin(pa), math.cos(pa)]])
+    v = v @ (Rx @ Ry).T
+    sx = (v[:, 0] * 0.46 + 0.5) * size
+    sy = (-v[:, 2] * 0.46 + 0.5) * size
+    depth = v[:, 1]
+    # нормали граней + сортировка художника (дальние первыми)
+    p0, p1, p2 = v[t[:, 0]], v[t[:, 1]], v[t[:, 2]]
+    n = np.cross(p1 - p0, p2 - p0)
+    ln = np.linalg.norm(n, axis=1); ln[ln == 0] = 1
+    n = n / ln[:, None]
+    light = np.array([0.4, -0.8, 0.45]); light = light / np.linalg.norm(light)
+    shade = 0.25 + 0.75 * np.abs(n @ light)
+    order = np.argsort(depth[t].mean(1))
+    img = Image.new("RGB", (size, size), (26, 28, 34))
+    dr = ImageDraw.Draw(img)
+    base = np.array([150, 170, 190], dtype=np.float32)
+    MAXTRI = 220000
+    step = 1 if len(order) <= MAXTRI else int(len(order) / MAXTRI) + 1
+    for i in order[::step]:
+        a, b, cc3 = t[i]
+        col = tuple(int(x) for x in base * shade[i])
+        dr.polygon([(sx[a], sy[a]), (sx[b], sy[b]), (sx[cc3], sy[cc3])], fill=col)
+    # склейка с иконкой
+    pad, cap = 6, 20
+    out = Image.new("RGB", (size * 2 + pad * 3, size + cap + pad * 2), (12, 12, 14))
+    out.paste(img, (pad, pad + cap))
+    if icon_path and os.path.isfile(icon_path):
+        ic = Image.open(icon_path).convert("RGB").resize((size, size))
+        out.paste(ic, (size + pad * 2, pad + cap))
+    d2 = ImageDraw.Draw(out)
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype("arial.ttf", 14)  # дефолтный шрифт PIL без кириллицы
+    except Exception:
+        font = None
+    d2.text((pad, 3), "%s  —  наш меш | иконка игры" % oid, fill=(220, 220, 220), font=font)
+    out.save(out_png)
+    return True
+
+
+# ------------------------------------------------------------------ сборка одной (подпроцесс)
+
+def build_one(scene_file, asset, staging, relax=False):
+    """Внутренний режим: conv2026 как модуль, OUTDIR -> staging.
+    relax=True: снять фильтр snap-REF (комнаты spacebase из SnapGroup_*)."""
+    import conv2026 as cc
+    cc.OUTDIR = staging.replace("\\", "/")
+    if relax:
+        cc.SKIPREF = SKIPREF_RELAX
+    print(cc.build(scene_file, asset))
+
+
+# ------------------------------------------------------------------ оркестратор
+
+def load_verified():
+    f = os.path.join(PROJ, "Content", "NMSData", "verified_meshes.json")
+    try:
+        with open(f, encoding="utf-8") as fh:
+            return {k for k in json.load(fh) if k != "_note"}
+    except Exception:
+        return set()
+
+
+def is_verified(verified, asset):
+    tail_a = "/" + asset.lower() + "."
+    return any(tail_a in k.lower().replace("\\", "/") for k in verified)
+
+
+def find_icon(oid):
+    for d in ICONS_DIRS:
+        f = os.path.join(d, oid + ".png")
+        if os.path.isfile(f):
+            return f
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="СТАНЦИЯ МЕШЕЙ: автосборка + проверки + превью")
+    ap.add_argument("--group", default="", help="группа каталога (Category из nms_parts_db.json)")
+    ap.add_argument("--ids", default="", help="список ТОЧНЫХ ObjectID через запятую")
+    ap.add_argument("--find", default="", help="поиск по ObjectID/имени (подстроки через запятую)")
+    ap.add_argument("--all", action="store_true", help="ВСЕ детали каталога")
+    ap.add_argument("--limit", type=int, default=0, help="только первые N деталей")
+    ap.add_argument("--mbin", default=DEF_MBIN, help="путь к MBINCompiler.exe")
+    ap.add_argument("--staging", default=DEF_STAGING, help="staging-папка (НЕ MeshSrc)")
+    ap.add_argument("--index", default=DEF_INDEX, help="папка NMS_INDEX (parts_links.json)")
+    ap.add_argument("--no-preview", action="store_true", help="без рендера превью")
+    ap.add_argument("--force-verified", action="store_true",
+                    help="при --promote перезаписывать и запечённые (проверка и так идёт по всем)")
+    ap.add_argument("--promote", action="store_true",
+                    help="скопировать ЗЕЛЁНЫЕ OBJ в MeshSrc + stage2_import_list.json (ЯВНОЕ действие)")
+    ap.add_argument("--build-one", nargs=2, metavar=("SCENE", "ASSET"),
+                    help="(внутреннее) собрать одну деталь")
+    ap.add_argument("--relax-snap", action="store_true",
+                    help="(внутреннее) не скипать SnapGroup-REF (комнаты spacebase)")
+    args = ap.parse_args()
+
+    if args.build_one:
+        build_one(args.build_one[0], args.build_one[1], args.staging, args.relax_snap)
+        return
+
+    if not (args.group or args.ids or args.find or args.all):
+        sys.exit("Нужно --group \"Имя группы\", --ids A,B, --find имя или --all")
+
+    links_path = os.path.join(args.index, "parts_links.json")
+    if not os.path.isfile(links_path):
+        sys.exit("Нет parts_links.json (сначала nms_indexer): " + links_path)
+    with open(links_path, encoding="utf-8") as fh:
+        _db_links = json.load(fh)
+    links = _db_links["parts"]
+    scenes_dict = _db_links.get("scenes") or {}
+    pcbanks = (_db_links.get("_source") or {}).get("pcbanks") or ""
+    with open(os.path.join(PROJ, "Content", "nms_parts_db.json"), encoding="utf-8") as fh:
+        db = json.load(fh)
+    verified = load_verified()
+
+    # доизвлекатель из паков (если паки и манифест на месте — иначе просто без него)
+    extr = None
+    manifest_path = os.path.join(args.index, "pak_manifest.json")
+    if os.path.isdir(pcbanks) and os.path.isfile(manifest_path) and os.path.isfile(args.mbin):
+        with open(manifest_path, encoding="utf-8") as fh:
+            extr = Extractor(pcbanks, json.load(fh), args.mbin)
+    else:
+        print("!! без доизвлечения из паков (нет PCBANKS/манифеста/MBINCompiler) — только локальные дампы")
+    try:
+        import conv2026 as _cc
+        geodirs = list(_cc.GEODIRS)
+    except Exception:
+        geodirs = [NE]
+
+    if args.ids:
+        want = [i.strip().lstrip("^") for i in args.ids.split(",") if i.strip()]
+        by_id = {p["ObjectID"].lstrip("^"): p for p in db}
+        parts = [(i, by_id.get(i)) for i in want]
+        group_name = "_ids"
+    elif args.find:
+        toks = [t.strip().upper() for t in args.find.split(",") if t.strip()]
+        parts = []
+        for p in db:
+            oid = p["ObjectID"].lstrip("^")
+            hay = (oid + "|" + str(p.get("DisplayName", "")) + "|" + str(p.get("Name", ""))).upper()
+            if any(t in hay for t in toks):
+                parts.append((oid, p))
+        group_name = "_поиск"
+        print("Поиск «%s»: найдено %d деталей" % (args.find, len(parts)))
+    elif args.all:
+        parts = [(p["ObjectID"].lstrip("^"), p) for p in db if p.get("bShowInDrawer", True)]
+        group_name = "_ВСЕ_ДЕТАЛИ"
+    else:
+        parts = [(p["ObjectID"].lstrip("^"), p) for p in db
+                 if p.get("Category") == args.group and p.get("bShowInDrawer", True)]
+        group_name = args.group
+    if args.limit:
+        parts = parts[:args.limit]
+
+    staging = os.path.join(args.staging, group_name.replace("/", "_"))
+    prev_dir = os.path.join(staging, "preview")
+    os.makedirs(prev_dir, exist_ok=True)
+    print("СТАНЦИЯ МЕШЕЙ: %s — %d деталей -> %s" % (group_name, len(parts), staging))
+    print("(в MeshSrc НИЧЕГО не пишется%s)" % ("" if not args.promote else "; --promote скопирует зелёные в конце"))
+
+    results = []
+    for k, (oid, p) in enumerate(parts, 1):
+        rec = {"id": oid, "asset": "", "status": "", "flags": [], "build": "", "preview": ""}
+        results.append(rec)
+
+        def done(status, *flags):
+            rec["status"] = status
+            rec["flags"].extend(flags)
+            print("  [%d/%d] %-20s %-6s %s" % (k, len(parts), oid, status, "; ".join(rec["flags"])[:150]))
+
+        if p is None:
+            done("КРАСН", "нет в nms_parts_db.json"); continue
+        asset = (p.get("ModelPath") or "").split("/")[-1].split(".")[0]
+        rec["asset"] = asset
+        if not asset:
+            done("СКИП", "нет меша в каталоге (спец-деталь: партикль/абстракция)"); continue
+        # проверка НИЧЕГО не пишет в проект -> проверяем и verified/запечённые
+        # (регресс-контроль после обновлений игры); защита от перезаписи — на --promote
+        if is_verified(verified, asset):
+            rec["flags"].append("запечён (защищён от --promote)")
+        if asset.lower() in PATHOLOGICAL:
+            done("СКИП", "известный виснущий меш (стопка вариантов) — собирать отдельно"); continue
+        custom_note = CUSTOM_BUILT.get(oid)
+
+        # --- авторитетная сцена. ПРИОРИТЕТ = ИГРА (принцип юзера 06.07), подсказки
+        # нашего каталога — последними и с клеймом:
+        # 1) partstable StyleModels[стиль детали] (игра, из parts_links);
+        # 2) placement-entity: Rules(NotSnapped)->PartID->partstable[стиль] (игра);
+        # 3) сцена из parts_links (игра; часто _placement — превью);
+        # 4) под-части/алиасы (ПОДСКАЗКА, решения юзера 01.07);
+        # 5) имя ассета '<стиль>_<база>' -> meshes/<стиль>/<база> (ПОДСКАЗКА каталога).
+        link = links.get(oid) or links.get(ALIAS_PART.get(oid, ""))
+        obj_style = ((link or {}).get("object") or {}).get("Style") or "None"
+        styles_map = (link or {}).get("styles") or {}
+        scene_game = styles_map.get(obj_style)
+        if not scene_game and link:
+            placement = (link.get("object") or {}).get("PlacementScene") or link.get("scene")
+            if placement:
+                pid2 = placement_entity_partid(placement, extr)
+                if pid2:
+                    pst = load_partstable(args.index).get(pid2) or {}
+                    sc2 = pst.get(obj_style) or pst.get("None") or (next(iter(pst.values())) if pst else None)
+                    if sc2:
+                        scene_game = sc2
+                        rec["flags"].append("сцена из placement-entity игры (%s)" % pid2)
+        if not scene_game and link:
+            scene_game = link.get("scene")
+        if not scene_game and oid in SUBPART_SCENE:
+            base = SUBPART_SCENE[oid]
+            scene_game = next((k for k in scenes_dict if k.endswith("/" + base + ".scene.mbin")), None)
+            if not scene_game:
+                scene_game = "models/planets/biomes/common/buildings/parts/buildableparts/spacebase/meshes/%s.scene.mbin" % base
+            if scene_game:
+                rec["flags"].append("ПОДСКАЗКА (решение юзера 01.07): сцена под-части")
+        if not scene_game:
+            scene_game = asset_styled_scene(asset, extr.man if extr else None)
+            if scene_game:
+                rec["flags"].append("ПОДСКАЗКА каталога: сцена по имени ассета")
+        scene_file = None
+        if not scene_game:
+            # под-части каталога без своей записи в objectstable (трубы, потолки комнат,
+            # варианты) — сцена ТОЧНО по имени ассета (паки, затем локальные дампы)
+            cands = alt_scene_candidates(asset, "", extr, geodirs)
+            if cands:
+                scene_file, why = cands[0]
+                rec["flags"].append("нет в objectstable; сцена %s" % why)
+            else:
+                done("КРАСН", "нет в parts_links и сцены по имени ассета не нашлось"); continue
+        n0 = extr.n_extracted if extr else 0
+        if scene_game:
+            scene_file = ensure_tree(scene_game, extr, geodirs)
+        if extr and extr.n_extracted > n0:
+            rec["flags"].append("доизвлечено из паков: %d файлов" % (extr.n_extracted - n0))
+        if not scene_file:
+            done("КРАСН", "сцены нет ни локально, ни в паках: " + scene_game); continue
+
+        hulls = (link or {}).get("hulls") or {}
+        hull = hulls.get(obj_style) or hulls.get("None") or (next(iter(hulls.values())) if hulls else None)
+        obj_path = os.path.join(staging, asset + ".obj")
+
+        def attempt(scene_f, relax=False):
+            """Сборка в подпроцессе (таймаут против зависаний) + все проверки."""
+            out = {"fatal": None, "red": [], "yellow": [], "info": [], "build": ""}
+            try:
+                cmd = [sys.executable, os.path.abspath(__file__),
+                       "--build-one", scene_f, asset, "--staging", staging]
+                if relax:
+                    cmd.append("--relax-snap")
+                cp = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=BUILD_TIMEOUT)
+                out["build"] = (cp.stdout or "").strip()[-200:]
+            except subprocess.TimeoutExpired:
+                out["fatal"] = "ЗАВИСЛА сборка (> %d c)" % BUILD_TIMEOUT
+                return out
+            if "ПУСТО" in out["build"]:
+                out["fatal"] = "ПУСТО (0 мешей LOD0)"
+                return out
+            if cp.returncode != 0 or not os.path.isfile(obj_path):
+                out["fatal"] = "ошибка конвертации: " + (cp.stderr or out["build"])[-160:]
+                return out
+            parsed = parse_obj(obj_path)
+            if not parsed:
+                out["fatal"] = "OBJ пустой/не читается"
+                return out
+            _verts, tris_obj, mats_obj, bbox = parsed
+            out["sz_mb"] = os.path.getsize(obj_path) / 1048576.0
+            if out["sz_mb"] > GIANT_MB:
+                out["yellow"].append("гигант %.0f МБ (импортировать отдельно/LOD)" % out["sz_mb"])
+
+            creds = []  # расхождения СО СЦЕНОЙ (смягчаются при совпадении с принятым мешом)
+            # 1) треугольники vs сцена игры
+            tris_game, mats_game = scene_lod0(scene_f, relax=relax)
+            out["tris"] = {"obj": len(tris_obj), "game": tris_game}
+            if tris_game and abs(len(tris_obj) - tris_game) > max(4, tris_game * 0.02):
+                creds.append("ТРЕУГ: obj %d vs игра %d" % (len(tris_obj), tris_game))
+            # 2) слоты/материалы vs сцена
+            game_set = [m for m in mats_game if m != "default"]
+            out["slots"] = {"obj": mats_obj, "game": game_set}
+            if game_set and sorted(mats_obj) != sorted(game_set):
+                miss = [m for m in game_set if m not in mats_obj]
+                extra = [m for m in mats_obj if m not in game_set]
+                if miss:
+                    creds.append("СЛОТЫ: нет %s" % ",".join(miss[:4]))
+                if extra:
+                    out["yellow"].append("СЛОТЫ: лишние %s" % ",".join(extra[:4]))
+            # 3) хулл MagicData
+            hred, hyel = [], []
+            nohull = None
+            if hull:
+                _mn, _mx, size_nms = obj_bbox_to_nms(bbox)
+                out["bbox_nms"] = {"size": size_nms, "hull": hull["size"]}
+                hred, hyel = hull_check(size_nms, hull)
+            else:
+                nohull = "нет хулла MagicData (сверить глазом)"
+            # совпадение с ПРИНЯТЫМ проектным мешом = сильный признак правильности:
+            # хулл-вопросы гасятся, расхождения со сценой понижаются до ЖЁЛТ (на глаз)
+            if project_match(asset, parsed):
+                out["info"].append("= принятый проектный меш 1:1")
+                if hred or hyel:
+                    out["info"].append("хулл-люфт %d (норма: хулл с запасом)" % (len(hred) + len(hyel)))
+                out["yellow"] = [c + " (но меш = принятый)" for c in creds] + out["yellow"]
+            else:
+                out["red"].extend(creds)
+                out["red"].extend(hred)
+                out["yellow"].extend(hyel)
+                if nohull:
+                    out["yellow"].append(nohull)
+            return out
+
+        # лесенка попыток: обычная сборка -> альтернативная сцена (по имени ассета) ->
+        # SnapGroup-relax (комнаты) -> свежая геометрия из паков при расхождении треуг.
+        relax_used = False
+        res = attempt(scene_file)
+        if res["fatal"] and "ПУСТО" in res["fatal"]:
+            for cand, why in alt_scene_candidates(asset, scene_file, extr, geodirs):
+                r2 = attempt(cand)
+                if not r2["fatal"]:
+                    r2["info"].append("альтернативная сцена (%s)" % why)
+                    scene_file, res = cand, r2
+                    break
+        if res["fatal"] and "ПУСТО" in res["fatal"]:
+            r2 = attempt(scene_file, relax=True)
+            if not r2["fatal"]:
+                r2["info"].append("собрано со SnapGroup-REF (комната spacebase)")
+                res, relax_used = r2, True
+        # самолечение: расхождение треугольников часто = УСТАРЕВШИЙ локальный дамп
+        # геометрии -> пере-извлечь свежую geometry.data из паков и собрать ещё раз
+        if res["fatal"] is None and extr is not None and scene_game \
+                and any(f.startswith("ТРЕУГ") for f in res["red"]):
+            ensure_tree(scene_game, extr, geodirs, force_geo=True)
+            res2 = attempt(scene_file, relax_used)
+            if res2["fatal"] is None and len(res2["red"]) < len(res["red"]):
+                res2["info"].append("вылечено свежей геометрией из паков (дамп был устаревший)")
+                res = res2
+        rec["build"] = res["build"]
+        if res["fatal"]:
+            done("КРАСН", res["fatal"]); continue
+        if custom_note:
+            # в проекте деталь намеренно собрана ИНАЧЕ (решение юзера) — расхождения
+            # свежей сборки со сценой ОЖИДАЕМЫ; вся деталь = ЖЁЛТ «не продвигать»,
+            # чтобы не попала в зелёный import_list и не перезаписала ручную сборку
+            res["yellow"] = ["в проекте собран ИНАЧЕ (%s) — не продвигать" % custom_note] \
+                            + res["red"] + res["yellow"]
+            res["red"] = []
+        for k2 in ("tris", "slots", "bbox_nms"):
+            if k2 in res:
+                rec[k2] = res[k2]
+
+        # превью рядом с иконкой
+        if not args.no_preview and res.get("sz_mb", 0) <= GIANT_MB:
+            icon = find_icon(oid)
+            png = os.path.join(prev_dir, oid + ".png")
+            try:
+                if render_preview(obj_path, icon, png, oid):
+                    rec["preview"] = png
+                if not icon:
+                    res["yellow"].append("нет иконки игры")
+            except Exception as e:
+                res["yellow"].append("превью не отрисовалось: %s" % e)
+
+        rec["flags"] = res["red"] + res["yellow"] + res["info"] + rec["flags"]
+        done("КРАСН" if res["red"] else ("ЖЁЛТ" if res["yellow"] else "ЗЕЛ"))
+
+    # ---------------- отчёт
+    order = {"КРАСН": 0, "ЖЁЛТ": 1, "ЗЕЛ": 2, "СКИП": 3}
+    results.sort(key=lambda r: (order.get(r["status"], 0), r["id"]))
+    cnt = {}
+    for r in results:
+        cnt[r["status"]] = cnt.get(r["status"], 0) + 1
+    lines = ["СТАНЦИЯ МЕШЕЙ — отчёт по группе: %s" % group_name,
+             "Итого: " + "  ".join("%s=%d" % kv for kv in sorted(cnt.items())),
+             "Staging: %s (MeshSrc НЕ тронут)" % staging,
+             "Превью (наш меш | иконка): %s" % prev_dir, ""]
+    for r in results:
+        lines.append("%-6s %-20s %-26s %s" % (r["status"], r["id"], r["asset"],
+                                              "; ".join(r["flags"])))
+    report = "\n".join(lines)
+    with open(os.path.join(staging, "ОТЧЁТ.txt"), "w", encoding="utf-8") as fh:
+        fh.write(report + "\n")
+    with open(os.path.join(staging, "meshwork_report.json"), "w", encoding="utf-8") as fh:
+        json.dump(results, fh, ensure_ascii=False, indent=1)
+    green = [r["asset"] for r in results if r["status"] == "ЗЕЛ"]
+    with open(os.path.join(staging, "import_list.json"), "w", encoding="utf-8") as fh:
+        json.dump(green, fh, ensure_ascii=False, indent=1)
+    print()
+    print("Итого: " + "  ".join("%s=%d" % kv for kv in sorted(cnt.items())))
+    print("Отчёт: %s\\ОТЧЁТ.txt; превью: %s" % (staging, prev_dir))
+    print("Зелёных к импорту: %d -> import_list.json" % len(green))
+
+    # ---------------- promote (ЯВНОЕ действие; ЕДИНСТВЕННОЕ место записи в проект)
+    if args.promote and green:
+        import shutil
+        # защита проверенного: запечённые НЕ перезаписываем без --force-verified
+        prot = [] if args.force_verified else [a for a in green if is_verified(verified, a)]
+        todo = [a for a in green if a not in prot]
+        if prot:
+            print("PROMOTE: %d запечённых пропущено (защита; --force-verified чтобы перезаписать): %s"
+                  % (len(prot), ", ".join(prot[:8]) + ("..." if len(prot) > 8 else "")))
+        dst_dir = os.path.join(PROJ, "MeshSrc")
+        for a in todo:
+            shutil.copy2(os.path.join(staging, a + ".obj"), os.path.join(dst_dir, a + ".obj"))
+        lst = os.path.join(PROJ, "Content", "Python", "stage2_import_list.json")
+        with open(lst, "w", encoding="utf-8") as fh:
+            json.dump(todo, fh, ensure_ascii=False, indent=1)
+        print("PROMOTE: %d OBJ скопировано в MeshSrc + %s" % (len(todo), lst))
+        print("Импорт (редактор ЗАКРЫТ): UnrealEditor.exe <uproject> "
+              "-ExecutePythonScript=<Content\\Python\\reimport_stage2.py> -nosound -unattended -nosplash")
+
+
+if __name__ == "__main__":
+    main()
