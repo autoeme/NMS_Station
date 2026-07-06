@@ -554,6 +554,33 @@ def _descriptor_groups(mx):
     return [(p, groups[p]) for p in order]
 
 
+_DESC_PREFIX_CACHE = {}
+
+def _folder_desc_map(bdir, extr):
+    """{префикс_опций ('_HEAD') -> сцена-кусок} по ВСЕМ дескрипторам папки семейства."""
+    if bdir in _DESC_PREFIX_CACHE:
+        return _DESC_PREFIX_CACHE[bdir]
+    out = {}
+    if extr is not None:
+        depth = bdir.count("/") + 1
+        for k in extr.man:
+            if k.startswith(bdir + "/") and k.endswith(".descriptor.mbin") and k.count("/") == depth:
+                mx = extr.fetch_decode(k, os.path.join(MW, _flat(k.replace(".descriptor.mbin", "")) + ".descriptor.mbin"))
+                if not mx:
+                    continue
+                groups = _descriptor_groups(mx)
+                for gi, (pref, _opts) in enumerate(groups):
+                    # правильная сцена-кусок = та, где группа ГЛАВНАЯ (первая) в её
+                    # собственном дескрипторе: у skulls первая группа _HEAD, у
+                    # скелетов (biped_bones/worm_bones) _HEAD — одна из многих
+                    rank = (gi != 0, len(groups))
+                    old = out.get(pref)
+                    if old is None or rank < old[1]:
+                        out[pref] = (k.replace(".descriptor.mbin", ".scene.mbin"), rank)
+    _DESC_PREFIX_CACHE[bdir] = out
+    return out
+
+
 def descriptor_variant(oid, links, extr, geodirs):
     """Каталожный ID-вариант (FOS_BI_BODY_AA) -> (сцена под-части, exclude-regex, заметка).
     Базовая деталь = длиннейший префикс ID, который ЕСТЬ в objectstable; остаток =
@@ -565,7 +592,16 @@ def descriptor_variant(oid, links, extr, geodirs):
         if cand in links:
             base, rest = cand, toks[cut:]
             break
-    if not base or not rest:
+    if base is None:
+        # у семейства нет своей базовой записи (FOS_HEAD_*: в таблице только
+        # FOS_SKULL-стенды) — папку кусков берём от ЛЮБОЙ детали семейства
+        fam = toks[0] + "_"
+        donor = next((k for k in sorted(links) if k.startswith(fam)
+                      and (links[k].get("scene") or links[k].get("styles"))), None)
+        if not donor:
+            return None
+        base, rest = donor, toks[1:]
+    if not rest:
         return None
     blink = links[base]
     bscene = (blink.get("styles") or {}).get((blink.get("object") or {}).get("Style") or "None") \
@@ -576,18 +612,28 @@ def descriptor_variant(oid, links, extr, geodirs):
     # В ТОЙ ЖЕ ПАПКЕ с именем группы: FOS_BI_BODY_AA -> fossils/body.scene,
     # FOS_BI_ARM_LEFT_A -> fossils/arm_left.scene. Точное имя в манифесте, без фуззи.
     bdir = os.path.dirname(_norm(bscene))
-    sub, opt = None, ""
+    sub, opt, group = None, "", ""
     for cut2 in range(len(rest) - 1, 0, -1):
         cand = bdir + "/" + "_".join(rest[:cut2]).lower() + ".scene.mbin"
         if cand in extr.man:
-            sub, opt = cand, "".join(rest[cut2:])
+            sub, opt, group = cand, "".join(rest[cut2:]), "_".join(rest[:cut2])
             break
     if not sub:
         # вариант без токена группы (FOS_HEAD_AA: базовая деталь FOS_HEAD — сама
         # стенд группы) — имя сцены-куска = последний токен базовой детали
         cand = bdir + "/" + base.split("_")[-1].lower() + ".scene.mbin"
         if cand in extr.man:
-            sub, opt = cand, "".join(rest)
+            sub, opt, group = cand, "".join(rest), base.split("_")[-1]
+    if not sub:
+        # имя сцены НЕ равно группе (HEAD -> skulls.scene): ищем в папке семейства
+        # дескриптор, у которого ПРЕФИКС ОПЦИЙ совпадает с группой ('_HEAD_AA')
+        dm = _folder_desc_map(bdir, extr)
+        for cut2 in range(len(rest) - 1, 0, -1):
+            pref = "_" + "_".join(rest[:cut2]).upper()
+            hit = next((p for p in dm if p.upper() == pref), None)
+            if hit:
+                sub, opt, group = dm[hit][0], "".join(rest[cut2:]), "_".join(rest[:cut2])
+                break
     if not sub:
         return None
     sfile = ensure_tree(sub, extr, geodirs)
@@ -595,17 +641,21 @@ def descriptor_variant(oid, links, extr, geodirs):
     if not sfile or not dmx:
         return None
     groups = _descriptor_groups(dmx)
-    # короткий префикс = основная группа: '_BODY' (буква 1), '_BODYAACC' (буква 2)...
-    groups.sort(key=lambda g: len(g[0]))
-    exact_grp = next((p for p, opts in groups if opt in opts), None)  # напр. '_HEAD' c 'BA'
+    # ПОРЯДОК БУКВ: буква №1 -> группа, СОВПАДАЮЩАЯ с токеном из ID ('_HEAD'/'_BODY'),
+    # дальше — остальные группы в порядке файла; кончились буквы/буква N -> NULL/NONE
+    main_key = "_" + group.upper()
+    groups.sort(key=lambda g: (g[0].upper() != main_key,))
+    NULLS = ("NULL", "NONE", "EMPTY")
+    exact_grp = next((p for p, opts in groups if opt in opts and len(opt) > 1), None)
     excl, note_sel = [], []
     li = 0
     for pref, opts in groups:
+        nullopt = next((o for o in opts if o in NULLS), "NULL")
         if exact_grp is not None:
-            want = opt if pref == exact_grp else "NULL"
+            want = opt if pref == exact_grp else nullopt
         else:
             letter = opt[li] if li < len(opt) else "N"
-            want = next((o for o in opts if o != "NULL" and o[:1] == letter), "NULL")
+            want = next((o for o in opts if o not in NULLS and o[:1] == letter), nullopt)
             li += 1
         note_sel.append("%s=%s" % (pref, want))
         for o in opts:
