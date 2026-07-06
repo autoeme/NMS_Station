@@ -26,7 +26,9 @@ nms_meshwork.py — «СТАНЦИЯ МЕШЕЙ»: автосборка меше
 САМА ДОИЗВЛЕКАЕТ недостающее из паков (06.07.2026): если точной сцены или ТОЧНОЙ
 СТИЛЕВОЙ геометрии (ловушка GDOOR: стили делят короткое имя basic_ramp.geometry!)
 нет в локальных дампах — достаёт из PCBANKS по pak_manifest.json и декодирует
-MBINCompiler'ом в NEW_EXTRACT_2026 (точное __-имя выигрывает у фолбэков conv2026).
+MBINCompiler'ом в СВОЮ папку MESHWORK_EXTRACT_2026 (точное __-имя выигрывает у
+фолбэков conv2026; в ОБЩУЮ NEW_EXTRACT_2026 НЕ ПИСАТЬ — урок 06.07: её глоб-резолверы
+других конвейеров затенялись placement-пустышками, детали портились).
 
 Использование:
     python nms_meshwork.py --group "Legacy Structures" [--limit N]
@@ -55,7 +57,11 @@ DEF_INDEX = r"C:\Users\User\Desktop\NMS_INDEX"
 DEF_STAGING = r"C:\Users\User\Desktop\MESHWORK_STAGING"
 DEF_MBIN = r"C:\Users\User\Desktop\MBINCompiler\MBINCompiler.exe"
 SC = r"C:\Users\User\Desktop\NMS_EXTRACT\SCENES_PARTS_NEW"
-NE = r"C:\Users\User\Desktop\MBINCompiler\NEW_EXTRACT_2026"
+NE = r"C:\Users\User\Desktop\MBINCompiler\NEW_EXTRACT_2026"      # ЧУЖАЯ, только чтение!
+# СВОЯ папка доизвлечения (УРОК 06.07: запись в общую NEW_EXTRACT_2026 затеняла
+# глоб-резолверы конвейера ДРУГОЙ сессии placement-пустышками — детали портились;
+# 2160 файлов вынесены сюда). Всё, что meshwork достаёт из паков, кладётся ТОЛЬКО сюда.
+MW = r"C:\Users\User\Desktop\MBINCompiler\MESHWORK_EXTRACT_2026"
 ICONS_DIRS = [os.path.join(DEF_INDEX, "icons"),
               r"C:\Users\User\Desktop\NMS_EXTRACT\ИКОНКИ_PNG"]
 
@@ -94,7 +100,7 @@ def resolve_scene_file(game_path):
     p = re.sub(r"_placement$", "", p)
     full = p.replace("\\", "__") + ".scene.MXML"
     wo = re.sub(r"^models__", "", full)
-    for d, fn in ((NE, full), (SC, full), (SC, wo)):
+    for d, fn in ((MW, full), (NE, full), (SC, full), (SC, wo)):
         f = os.path.join(d, fn)
         if os.path.isfile(f):
             return f
@@ -157,7 +163,7 @@ def exact_scene_local(game_path):
     p = re.sub(r"_placement$", "", _norm(game_path).replace(".scene.mbin", ""))
     full = _flat(p) + ".scene.MXML"
     wo = re.sub(r"^models__", "", full)
-    for d, fn in ((NE, full), (SC, full), (SC, wo)):
+    for d, fn in ((MW, full), (NE, full), (SC, full), (SC, wo)):
         f = os.path.join(d, fn)
         if os.path.isfile(f):
             return f
@@ -196,13 +202,13 @@ def ensure_tree(game_scene, extr, geodirs, depth=0, force_geo=False):
     if sf is None and extr is not None:
         # базовая сцена (без _placement) из паков
         p = re.sub(r"_placement$", "", key.replace(".scene.mbin", ""))
-        sf = extr.fetch_decode(p + ".scene.mbin", os.path.join(NE, _flat(p) + ".scene.mbin"))
+        sf = extr.fetch_decode(p + ".scene.mbin", os.path.join(MW, _flat(p) + ".scene.mbin"))
     if sf is None:
         # нестрогий поиск по дампам (короткие имена SCENES_PARTS_NEW) —
         # РАНЬШЕ извлечения placement: placement часто пустая обёртка (RefWall+локатор)
         sf = resolve_scene_file(game_scene)
     if sf is None and extr is not None:
-        sf = extr.fetch_decode(key, os.path.join(NE, _flat(key.replace(".scene.mbin", "")) + ".scene.mbin"))
+        sf = extr.fetch_decode(key, os.path.join(MW, _flat(key.replace(".scene.mbin", "")) + ".scene.mbin"))
     _ENSURED[key] = sf
     if sf is None:
         return None
@@ -224,11 +230,11 @@ def ensure_tree(game_scene, extr, geodirs, depth=0, force_geo=False):
         g = aa.get("GEOMETRY")
         if g and extr is not None:
             p = re.sub(r"\.geometry(\.mbin)?(\.pc)?$", "", _norm(g))
-            ne_mx = os.path.join(NE, _flat(p) + ".geometry.data.MXML")
+            ne_mx = os.path.join(MW, _flat(p) + ".geometry.data.MXML")
             need = (not exact_geo_exists(g, geodirs)) or (force_geo and not os.path.isfile(ne_mx))
             if need:
                 for cand in (p + ".geometry.data.mbin.pc", p + ".geometry.data.mbin"):
-                    if extr.fetch_decode(cand, os.path.join(NE, _flat(p) + ".geometry.data.mbin")):
+                    if extr.fetch_decode(cand, os.path.join(MW, _flat(p) + ".geometry.data.mbin")):
                         break
         sg = aa.get("SCENEGRAPH")
         nm = P(node, "Name")
@@ -447,7 +453,7 @@ def ensure_exact_scene(game_path, extr):
         if os.path.isfile(f):
             return f
     if extr is not None:
-        return extr.fetch_decode(p + ".scene.mbin", os.path.join(NE, _flat(p) + ".scene.mbin"))
+        return extr.fetch_decode(p + ".scene.mbin", os.path.join(MW, _flat(p) + ".scene.mbin"))
     return None
 
 
@@ -467,21 +473,31 @@ def placement_entity_partid(placement_path, extr):
     ent_key = _norm(att[0])
     mx = None
     if extr is not None:
-        mx = extr.fetch_decode(ent_key, os.path.join(NE, _flat(ent_key.replace(".entity.mbin", "")) + ".entity.mbin"))
+        mx = extr.fetch_decode(ent_key, os.path.join(MW, _flat(ent_key.replace(".entity.mbin", "")) + ".entity.mbin"))
     if not mx:
         return None
     etxt = open(mx, encoding="utf-8", errors="replace").read()
-    first_pid = None
+    rules = []
     for block in re.split(r'value="GcBasePlacementRule"', etxt)[1:]:
         pm = re.search(r'<Property name="PartID" value="([^"]+)"', block)
         if not pm:
             continue
-        if first_pid is None:
-            first_pid = pm.group(1)
+        lm = re.search(r'<Property name="PositionLocator" value="([^"]*)"', block)
         states = re.findall(r'<Property name="SnapState" value="(NotSnapped|IsSnapped)"', block)
-        if states and all(s == "NotSnapped" for s in states):
-            return pm.group(1)  # дефолтное состояние одиночной детали
-    return first_pid
+        rules.append((pm.group(1), lm.group(1) if lm else "",
+                      bool(states) and all(s == "NotSnapped" for s in states)))
+    if not rules:
+        return None
+    # РАЗЛИЧИТЕЛЬ (проверен по данным 06.07): у «подмен» (стена _WALLB/M/T, дверь
+    # _DOORB0/_DOORWINB0, корвет-модуль) ВСЕ правила на ОДНОМ локаторе — деталь
+    # показывает один PartID за раз; у «сборки» (комната cuberoom: пол + стороны +
+    # углы) локаторы РАЗНЫЕ — единого визуала нет, entity-цепочка НЕ применима.
+    if len({loc for _pid, loc, _ns in rules}) > 1:
+        return None
+    for pid, _loc, ns in rules:
+        if ns:
+            return pid  # дефолтное состояние одиночной детали (NotSnapped)
+    return rules[0][0]
 
 
 def alt_scene_candidates(asset, primary, extr, geodirs):
@@ -499,7 +515,7 @@ def alt_scene_candidates(asset, primary, extr, geodirs):
                 if f and f not in seen:
                     out.append((f, "по имени ассета из паков"))
                     seen.add(f)
-    for d in (NE, SC):
+    for d in (MW, NE, SC):
         for fn in (_g.glob(os.path.join(d, "*__" + a + ".scene.MXML")) +
                    _g.glob(os.path.join(d, a + ".scene.MXML"))):
             if fn not in seen:
@@ -595,9 +611,14 @@ def render_preview(obj_path, icon_path, out_png, oid, size=384):
 
 def build_one(scene_file, asset, staging, relax=False):
     """Внутренний режим: conv2026 как модуль, OUTDIR -> staging.
-    relax=True: снять фильтр snap-REF (комнаты spacebase из SnapGroup_*)."""
+    relax=True: снять фильтр snap-REF (комнаты spacebase из SnapGroup_*).
+    Свою папку доизвлечения подкладываем конвертеру ПЕРВОЙ (только в этом
+    процессе — глобальные списки conv2026 на диске не меняются)."""
     import conv2026 as cc
     cc.OUTDIR = staging.replace("\\", "/")
+    mw = MW.replace("\\", "/")
+    cc.SCDIRS.insert(0, mw)
+    cc.GEODIRS.insert(0, mw)
     if relax:
         cc.SKIPREF = SKIPREF_RELAX
     print(cc.build(scene_file, asset))
@@ -675,11 +696,12 @@ def main():
             extr = Extractor(pcbanks, json.load(fh), args.mbin)
     else:
         print("!! без доизвлечения из паков (нет PCBANKS/манифеста/MBINCompiler) — только локальные дампы")
+    os.makedirs(MW, exist_ok=True)
     try:
         import conv2026 as _cc
-        geodirs = list(_cc.GEODIRS)
+        geodirs = [MW] + list(_cc.GEODIRS)
     except Exception:
-        geodirs = [NE]
+        geodirs = [MW, NE]
 
     if args.ids:
         want = [i.strip().lstrip("^") for i in args.ids.split(",") if i.strip()]
