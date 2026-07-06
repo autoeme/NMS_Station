@@ -131,6 +131,16 @@ class Extractor(object):
             self.paks[rec["pak"]] = HGPak(os.path.join(self.pcbanks, rec["pak"]))
         return self.paks[rec["pak"]].extract(rec["index"])
 
+    def head(self, key, n=256):
+        """Первые n байт файла из пака (заголовки DDS) без полного извлечения."""
+        rec = self.man.get(key)
+        if rec is None:
+            return None
+        if rec["pak"] not in self.paks:
+            from nms_finish import HGPak
+            self.paks[rec["pak"]] = HGPak(os.path.join(self.pcbanks, rec["pak"]))
+        return self.paks[rec["pak"]].read_head(rec["index"], n)
+
     def fetch_decode(self, key, dst_mbin):
         """извлечь key из паков в dst_mbin и декодировать; вернуть путь MXML или None."""
         mx = re.sub(r"\.mbin(\.pc)?$", ".MXML", dst_mbin, flags=re.I)
@@ -509,6 +519,192 @@ def placement_entity_partid(placement_path, extr):
     return rules[0][0]
 
 
+# ------------------------------------------------------------------ ЕДИНОЕ ДРЕВО ДЕТАЛИ
+# Запрос юзера 07.07: при запекании группы вечно «не тот атлас или цвет» — программа
+# должна САМА безошибочно найти материалы/текстуры/цвета каждой детали из ПАКОВ и
+# выдать единое дерево: узлы сцены -> материал -> текстуры (+наличие, +слои) -> цвет.
+# Дерево = будущий источник part_slots (текстурный пасс группы без ручной возни).
+
+MAT_TYPE_HINT = {  # класс материала игры -> тип слота приложения (уроки group-by-group)
+    "Glow": "unlit", "Cutout": "masked", "DoubleSided": "masked",
+    "GlowTranslucent": "holo", "Additive": "holo",
+    "Translucent": "glass", "SSR": "glass",
+}
+
+_FINISH = None
+
+def load_finish(index_dir):
+    global _FINISH
+    if _FINISH is None:
+        try:
+            with open(os.path.join(index_dir, "finish_layers.json"), encoding="utf-8") as fh:
+                _FINISH = json.load(fh)
+        except Exception:
+            _FINISH = {}
+    return _FINISH
+
+
+def parse_material_local(mx):
+    """class/flags/цвет/сэмплеры из .MATERIAL.MXML (схема как у индексатора)."""
+    try:
+        tree = ET.parse(mx)
+    except ET.ParseError as e:
+        return {"error": "parse: %s" % e}
+    flags, samplers, out = [], [], {"class": "", "colour": None}
+
+    def rec(el):
+        name = el.get("name")
+        if name == "MaterialFlag":
+            flags.append(el.get("value"))
+        elif name == "MaterialClass":
+            out["class"] = el.get("value")
+        elif name == "Samplers" and el.get("value") == "TkMaterialSampler":
+            d = {c.get("name"): c.get("value") for c in el.findall("Property")}
+            samplers.append({"name": d.get("Name", ""), "map": d.get("Map", ""),
+                             "srgb": d.get("IsSRGB", "")})
+        elif name == "Uniforms_Float" and el.get("value") == "TkMaterialUniform_Float":
+            ps = {c.get("name"): c for c in el.findall("Property")}
+            if ps.get("Name") is not None and ps["Name"].get("value") == "gMaterialColourVec4":
+                vals = re.findall(r'value="([-\d.]+)"', ET.tostring(el, encoding="unicode"))
+                out["colour"] = vals[1:5] if len(vals) > 4 else vals
+        for c in el:
+            rec(c)
+
+    rec(tree.getroot())
+    out["flags"] = flags
+    out["samplers"] = samplers
+    return out
+
+
+def collect_tree(scene_file, relax=False, depth=0, seen=None, prefix=""):
+    """[(путь_узла, материал_game_path, треугольники)] по LOD0 с REF-рекурсией."""
+    skip_re = SKIPREF_RELAX if relax else SKIPREF
+    if seen is None:
+        seen = set()
+    if scene_file in seen or depth > 6:
+        return []
+    seen.add(scene_file)
+    try:
+        root = ET.parse(scene_file).getroot()
+    except ET.ParseError:
+        return []
+    out = []
+
+    def attrs_of(node):
+        d = {}
+        a = P(node, "Attributes")
+        if a is not None:
+            for c in a.findall("Property"):
+                if c.get("value") == "TkSceneNodeAttributeData":
+                    nm, val = P(c, "Name"), P(c, "Value")
+                    if nm is not None and val is not None:
+                        d[nm.get("value")] = val.get("value")
+        return d
+
+    def rec(node, lod_ctx, pfx):
+        nm, tp = P(node, "Name"), P(node, "Type")
+        if nm is None or tp is None:
+            return
+        name, typ = nm.get("value").split("|")[-1], tp.get("value")
+        m = LODRE.search(name.lower())
+        lod = int(m.group(1)) if m else lod_ctx
+        aa = attrs_of(node)
+        if typ == "MESH" and not SKIPNAME.search(name.lower()) and (lod is None or lod == 0):
+            out.append((pfx + name, aa.get("MATERIAL", ""),
+                        int(aa.get("BATCHCOUNT", 0) or 0) // 3))
+        elif typ == "REFERENCE" and (lod is None or lod == 0):
+            sg = aa.get("SCENEGRAPH", "")
+            if sg and not skip_re.search((name + sg).lower()):
+                rf = resolve_scene_file(sg)
+                if rf:
+                    out.extend(collect_tree(rf, relax, depth + 1, seen, pfx + name + "/"))
+        ch = P(node, "Children")
+        if ch is not None:
+            for c in ch.findall("Property"):
+                if c.get("value") == "TkSceneNodeData":
+                    rec(c, lod, pfx)
+
+    rec(root, None, prefix)
+    return out
+
+
+def part_tree(oid, asset, scene_game, scene_file, relax, extr, obj_slots, index_dir):
+    """Единое дерево детали. Возвращает (tree, нет_материалов, нет_текстур)."""
+    manifest = extr.man if extr else {}
+    nodes = collect_tree(scene_file, relax)
+    mats, missing_mat, missing_tex = {}, [], []
+    for _n, mp, _t in nodes:
+        k = _norm(mp) if mp else ""
+        if not k or k in mats:
+            continue
+        mx = None
+        if extr is not None:
+            mx = extr.fetch_decode(k, os.path.join(MW, _flat(k.replace(".material.mbin", "")) + ".material.mbin"))
+        if mx:
+            mi = parse_material_local(mx)
+        else:
+            mi = {"error": "нет в паках", "samplers": [], "flags": [], "class": "", "colour": None}
+            missing_mat.append(os.path.basename(mp).split(".")[0])
+        mi["type_hint"] = MAT_TYPE_HINT.get(mi.get("class", ""), "lit")
+        for s in mi.get("samplers", []):
+            mk = _norm(s.get("map", ""))
+            s["in_pak"] = bool(mk) and mk in manifest
+            if s.get("map") and not s["in_pak"]:
+                missing_tex.append(os.path.basename(s["map"]))
+            if s["name"] == "gDiffuseMap" and s["in_pak"] and extr is not None:
+                try:
+                    from nms_finish import dds_info
+                    info = dds_info(extr.head(mk, 256) or b"")
+                    s["layers"] = info.get("layers") if info else None
+                except Exception:
+                    pass
+        mats[k] = mi
+    # слоты OBJ (usemtl, порядок = слоты меша) -> полный путь материала по базовому имени
+    by_base = {}
+    for _n, mp, _t in nodes:
+        if mp:
+            by_base.setdefault(os.path.basename(mp).split(".")[0].lower(), _norm(mp))
+    slots = [{"n": i + 1, "usemtl": s, "material": by_base.get(s.lower(), "")}
+             for i, s in enumerate(obj_slots or [])]
+    fin = (load_finish(index_dir).get("parts") or {}).get(oid) or {}
+    tree = {"id": oid, "asset": asset, "scene": scene_game,
+            "default_finish": fin.get("DefaultMaterialId", ""),
+            "default_palette": fin.get("DefaultColourPaletteId", ""),
+            "slots": slots,
+            "nodes": [{"node": n, "material": _norm(mp) if mp else "", "tris": t}
+                      for n, mp, t in nodes],
+            "materials": mats}
+    return tree, missing_mat, sorted(set(missing_tex))
+
+
+def render_tree_txt(tree):
+    L = ["ДЕРЕВО ДЕТАЛИ: %s  (ассет %s)" % (tree["id"], tree["asset"]),
+         "сцена: %s" % tree["scene"],
+         "отделка по умолчанию: %s   палитра: %s" % (tree["default_finish"] or "—",
+                                                     tree["default_palette"] or "—"), ""]
+    L.append("СЛОТЫ (порядок usemtl OBJ = слоты меша):")
+    for s in tree["slots"]:
+        mi = tree["materials"].get(s["material"] or "", {})
+        L.append(" %2d. %-34s [%s -> %s]%s" % (
+            s["n"], s["usemtl"], mi.get("class") or "?", mi.get("type_hint", "lit"),
+            "  цвет %s" % ",".join(mi["colour"]) if mi.get("colour") else ""))
+        for smp in mi.get("samplers", []):
+            extra = ""
+            if smp.get("layers") and smp["layers"] > 1:
+                extra = "  (слоёв: %d — мультитекстура!)" % smp["layers"]
+            L.append("      %-4s %-16s %s %s%s" % (
+                "OK" if smp.get("in_pak") else "НЕТ!", smp.get("name", ""),
+                smp.get("map", ""), "sRGB" if smp.get("srgb") == "true" else "", extra))
+        if mi.get("flags"):
+            L.append("      флаги: %s" % " ".join(mi["flags"]))
+    L.append("")
+    L.append("УЗЛЫ СЦЕНЫ (LOD0):")
+    for n in tree["nodes"]:
+        L.append(" %-52s %6d трг  %s" % (n["node"][-52:], n["tris"],
+                                         os.path.basename(n["material"]).split(".")[0]))
+    return "\n".join(L)
+
+
 def alt_scene_candidates(asset, primary, extr, geodirs):
     """Запасные сцены при ПУСТО: сцена, названная ТОЧНО по имени ассета проекта
     (пример: BRIDGECONNECTOR -> меш cubesolid, юзер подтвердил 01.07.2026) —
@@ -739,7 +935,9 @@ def main():
 
     staging = os.path.join(args.staging, group_name.replace("/", "_"))
     prev_dir = os.path.join(staging, "preview")
+    trees_dir = os.path.join(staging, "trees")
     os.makedirs(prev_dir, exist_ok=True)
+    os.makedirs(trees_dir, exist_ok=True)
     print("СТАНЦИЯ МЕШЕЙ: %s — %d деталей -> %s" % (group_name, len(parts), staging))
     print("(в MeshSrc НИЧЕГО не пишется%s)" % ("" if not args.promote else "; --promote скопирует зелёные в конце"))
 
@@ -938,6 +1136,24 @@ def main():
             except Exception as e:
                 res["yellow"].append("превью не отрисовалось: %s" % e)
 
+        # ЕДИНОЕ ДРЕВО ДЕТАЛИ: узлы -> материал -> текстуры -> цвет (1:1 из паков);
+        # отсутствие материала/текстуры в паках — сразу в вердикт
+        try:
+            tree, miss_m, miss_t = part_tree(oid, asset, scene_game or "", scene_file,
+                                             relax_used, extr, rec.get("slots", {}).get("obj"),
+                                             args.index)
+            with open(os.path.join(trees_dir, oid + ".json"), "w", encoding="utf-8") as fh:
+                json.dump(tree, fh, ensure_ascii=False, indent=1)
+            with open(os.path.join(trees_dir, oid + ".txt"), "w", encoding="utf-8") as fh:
+                fh.write(render_tree_txt(tree) + "\n")
+            rec["tree"] = os.path.join(trees_dir, oid + ".json")
+            if miss_m:
+                res["red"].append("МАТЕРИАЛ нет в паках: %s" % ",".join(miss_m[:3]))
+            if miss_t:
+                res["yellow"].append("ТЕКСТУРА нет в паках: %s" % ",".join(miss_t[:3]))
+        except Exception as e:
+            res["yellow"].append("дерево не построилось: %s" % e)
+
         rec["flags"] = res["red"] + res["yellow"] + res["info"] + rec["flags"]
         done("КРАСН" if res["red"] else ("ЖЁЛТ" if res["yellow"] else "ЗЕЛ"))
 
@@ -950,7 +1166,8 @@ def main():
     lines = ["СТАНЦИЯ МЕШЕЙ — отчёт по группе: %s" % group_name,
              "Итого: " + "  ".join("%s=%d" % kv for kv in sorted(cnt.items())),
              "Staging: %s (MeshSrc НЕ тронут)" % staging,
-             "Превью (наш меш | иконка): %s" % prev_dir, ""]
+             "Превью (наш меш | иконка): %s" % prev_dir,
+             "Деревья деталей (узлы/материалы/текстуры/цвет): %s" % trees_dir, ""]
     for r in results:
         lines.append("%-6s %-20s %-26s %s" % (r["status"], r["id"], r["asset"],
                                               "; ".join(r["flags"])))
