@@ -23,12 +23,11 @@ nms_meshwork.py — «СТАНЦИЯ МЕШЕЙ»: автосборка меше
   - патологические меши (виснущие стопки вариантов) собираются с таймаутом в подпроцессе.
 Автоматика глаз НЕ заменяет: итог всегда «посмотри превью» (папка preview рядом с отчётом).
 
-САМА ДОИЗВЛЕКАЕТ недостающее из паков (06.07.2026): если точной сцены или ТОЧНОЙ
-СТИЛЕВОЙ геометрии (ловушка GDOOR: стили делят короткое имя basic_ramp.geometry!)
-нет в локальных дампах — достаёт из PCBANKS по pak_manifest.json и декодирует
-MBINCompiler'ом в СВОЮ папку MESHWORK_EXTRACT_2026 (точное __-имя выигрывает у
-фолбэков conv2026; в ОБЩУЮ NEW_EXTRACT_2026 НЕ ПИСАТЬ — урок 06.07: её глоб-резолверы
-других конвейеров затенялись placement-пустышками, детали портились).
+ВСЁ С НУЛЯ ИЗ ИГРЫ (решение юзера 07.07.2026): порядок свежести данных —
+1) своя MESHWORK_EXTRACT_2026 (кэш уже извлечённого из паков), 2) ПАКИ игры
+(извлечь+декодировать MBINCompiler'ом), 3) старые дампы — ТОЛЬКО если файла нет
+в паках (в отчёте пометка «из СТАРЫХ дампов»). В ОБЩУЮ NEW_EXTRACT_2026 НЕ ПИСАТЬ
+(урок 06.07: её глоб-резолверы других конвейеров затенялись placement-пустышками).
 
 Использование:
     python nms_meshwork.py --group "Legacy Structures" [--limit N]
@@ -183,30 +182,31 @@ def exact_geo_exists(geom_attr, geodirs):
 
 
 _ENSURED = {}
-_FORCED = set()
+LEGACY_USED = set()   # файлы из СТАРЫХ дампов (в паках не нашлись) — помечаются в отчёте
 
 def ensure_tree(game_scene, extr, geodirs, depth=0, force_geo=False):
-    """Гарантирует точные локальные файлы: сцена (+ _placement-подложка),
-    её geometry.data и рекурсивно все REFERENCE-сцены. Возвращает файл сцены.
-    force_geo=True: дополнительно кладёт СВЕЖУЮ geometry.data из паков в
-    NEW_EXTRACT_2026, даже если точный файл есть в старых дампах (лечит
-    устаревшие дампы: в GEO2 телепорт без portalscroll)."""
+    """Гарантирует СВЕЖИЕ локальные файлы: сцена, её geometry.data и рекурсивно все
+    REFERENCE-сцены. ПОРЯДОК СВЕЖЕСТИ (решение юзера 07.07 «всё с нуля из игры»):
+    1) своя MESHWORK_EXTRACT_2026 (уже извлечённое из паков),
+    2) ПАКИ игры (извлечь+декодировать),
+    3) старые дампы — ТОЛЬКО если в паках нет (файл попадает в LEGACY_USED),
+    4) placement-обёртка из паков — последний шанс.
+    force_geo оставлен для совместимости (свежесть теперь всегда)."""
     key = _norm(game_scene)
-    if depth > 6:
+    if depth > 6 or key in _ENSURED:
         return _ENSURED.get(key)
-    if key in _ENSURED and (not force_geo or key in _FORCED):
-        return _ENSURED.get(key)
-    if force_geo:
-        _FORCED.add(key)
-    sf = exact_scene_local(game_scene)
+    p = re.sub(r"_placement$", "", key.replace(".scene.mbin", ""))
+    sf = None
+    f = os.path.join(MW, _flat(p) + ".scene.MXML")
+    if os.path.isfile(f):
+        sf = f
     if sf is None and extr is not None:
-        # базовая сцена (без _placement) из паков
-        p = re.sub(r"_placement$", "", key.replace(".scene.mbin", ""))
         sf = extr.fetch_decode(p + ".scene.mbin", os.path.join(MW, _flat(p) + ".scene.mbin"))
     if sf is None:
-        # нестрогий поиск по дампам (короткие имена SCENES_PARTS_NEW) —
-        # РАНЬШЕ извлечения placement: placement часто пустая обёртка (RefWall+локатор)
-        sf = resolve_scene_file(game_scene)
+        # в паках базовой нет — старые дампы (точное имя, затем нестрогий поиск)
+        sf = exact_scene_local(game_scene) or resolve_scene_file(game_scene)
+        if sf:
+            LEGACY_USED.add(sf)
     if sf is None and extr is not None:
         sf = extr.fetch_decode(key, os.path.join(MW, _flat(key.replace(".scene.mbin", "")) + ".scene.mbin"))
     _ENSURED[key] = sf
@@ -229,13 +229,16 @@ def ensure_tree(game_scene, extr, geodirs, depth=0, force_geo=False):
                         aa[nm.get("value")] = val.get("value")
         g = aa.get("GEOMETRY")
         if g and extr is not None:
-            p = re.sub(r"\.geometry(\.mbin)?(\.pc)?$", "", _norm(g))
-            ne_mx = os.path.join(MW, _flat(p) + ".geometry.data.MXML")
-            need = (not exact_geo_exists(g, geodirs)) or (force_geo and not os.path.isfile(ne_mx))
-            if need:
-                for cand in (p + ".geometry.data.mbin.pc", p + ".geometry.data.mbin"):
-                    if extr.fetch_decode(cand, os.path.join(MW, _flat(p) + ".geometry.data.mbin")):
+            p2 = re.sub(r"\.geometry(\.mbin)?(\.pc)?$", "", _norm(g))
+            mw_mx = os.path.join(MW, _flat(p2) + ".geometry.data.MXML")
+            if not os.path.isfile(mw_mx):
+                got = None
+                for cand in (p2 + ".geometry.data.mbin.pc", p2 + ".geometry.data.mbin"):
+                    got = extr.fetch_decode(cand, os.path.join(MW, _flat(p2) + ".geometry.data.mbin"))
+                    if got:
                         break
+                if not got and exact_geo_exists(g, geodirs):
+                    LEGACY_USED.add(_norm(g))   # геометрия только в старом дампе
         sg = aa.get("SCENEGRAPH")
         nm = P(node, "Name")
         name = nm.get("value").split("|")[-1] if nm is not None else ""
@@ -444,16 +447,22 @@ def load_partstable(index_dir):
 
 def ensure_exact_scene(game_path, extr):
     """Точный локальный файл сцены БЕЗ среза _placement (для чтения entity самой
-    placement-сцены); нет локально — извлечь из паков."""
+    placement-сцены). Свежесть: своя папка -> ПАКИ -> старые дампы (с пометкой)."""
     p = _norm(game_path).replace(".scene.mbin", "")
     full = _flat(p) + ".scene.MXML"
+    f = os.path.join(MW, full)
+    if os.path.isfile(f):
+        return f
+    if extr is not None:
+        f = extr.fetch_decode(p + ".scene.mbin", os.path.join(MW, _flat(p) + ".scene.mbin"))
+        if f:
+            return f
     wo = re.sub(r"^models__", "", full)
     for d, fn in ((NE, full), (SC, full), (SC, wo)):
         f = os.path.join(d, fn)
         if os.path.isfile(f):
+            LEGACY_USED.add(f)
             return f
-    if extr is not None:
-        return extr.fetch_decode(p + ".scene.mbin", os.path.join(MW, _flat(p) + ".scene.mbin"))
     return None
 
 
@@ -803,10 +812,13 @@ def main():
             else:
                 done("КРАСН", "нет в parts_links и сцены по имени ассета не нашлось"); continue
         n0 = extr.n_extracted if extr else 0
+        l0 = len(LEGACY_USED)
         if scene_game:
             scene_file = ensure_tree(scene_game, extr, geodirs)
         if extr and extr.n_extracted > n0:
-            rec["flags"].append("доизвлечено из паков: %d файлов" % (extr.n_extracted - n0))
+            rec["flags"].append("извлечено из игры: %d файлов" % (extr.n_extracted - n0))
+        if len(LEGACY_USED) > l0:
+            rec["flags"].append("из СТАРЫХ дампов: %d файлов (в паках не нашлись)" % (len(LEGACY_USED) - l0))
         if not scene_file:
             done("КРАСН", "сцены нет ни локально, ни в паках: " + scene_game); continue
 
@@ -899,15 +911,7 @@ def main():
             if not r2["fatal"]:
                 r2["info"].append("собрано со SnapGroup-REF (комната spacebase)")
                 res, relax_used = r2, True
-        # самолечение: расхождение треугольников часто = УСТАРЕВШИЙ локальный дамп
-        # геометрии -> пере-извлечь свежую geometry.data из паков и собрать ещё раз
-        if res["fatal"] is None and extr is not None and scene_game \
-                and any(f.startswith("ТРЕУГ") for f in res["red"]):
-            ensure_tree(scene_game, extr, geodirs, force_geo=True)
-            res2 = attempt(scene_file, relax_used)
-            if res2["fatal"] is None and len(res2["red"]) < len(res["red"]):
-                res2["info"].append("вылечено свежей геометрией из паков (дамп был устаревший)")
-                res = res2
+        # (повтор со «свежей геометрией» больше не нужен: свежесть из паков — всегда)
         rec["build"] = res["build"]
         if res["fatal"]:
             done("КРАСН", res["fatal"]); continue
