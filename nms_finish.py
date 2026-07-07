@@ -20,6 +20,19 @@ parts_links.json НЕ меняет — пишет СВОЙ файл finish_layer
      DefaultColourPaletteId записей objectstable (своя стриминг-читалка,
      КОПИЯ по образцу nms_indexer.py — индексатор не модифицируется).
 
+★ ДОБОР 07.07.2026 (после сверки с симулятором nms_runtime.py, который нашёл
+~190 деталей с массивами-атласами, отсутствовавших в parts-разделе):
+  а) связь деталь→материалы теперь собирается РЕКУРСИВНО по сценам: стилевые
+     сцены partstable + сцена детали + PlacementScene, с обходом REFERENCE-узлов
+     (граф сцен из parts_links; сцены, которых в графе нет, допарсиваются из
+     raw/паков). Пример закрытой дыры: CONTAINER0 — сцена сама без мешей, ящик
+     и цифра приходят по REFERENCE (cubecrate + number_0), их материалы раньше
+     терялись.
+  б) материал считается «мультитекстурным» не только по флагу _F55_MULTITEXTURE,
+     но и по ФАКТУ: любой его сэмплер ссылается на DDS со слоями (layers>1).
+     Для материалов БЕЗ _F55 со слоёным атласом слой из данных НЕ определён —
+     фиксируется явной пометкой (не гадаем).
+
 Использование:
     python nms_finish.py [--index ПАПКА] [--pcbanks ПАПКА] [--mbin EXE] [--out ФАЙЛ]
 
@@ -27,7 +40,8 @@ parts_links.json НЕ меняет — пишет СВОЙ файл finish_layer
 --out <index>\\finish_layers.json.
 
 Самопроверка (посчитано по базе 06.07.2026): материалов с _F55_MULTITEXTURE = 666,
-затронутых деталей = 967; известные слои: тримы = 2, basebuildingexterior = 4, biggs = 4.
+деталей СТАРЫМ методом (scene_materials ∩ F55) = 967; известные слои: тримы = 2,
+basebuildingexterior = 4, biggs = 4.
 """
 import argparse
 import json
@@ -53,7 +67,15 @@ TABLE_OBJECTS = "metadata/reality/tables/basebuildingobjectstable.mbin"
 
 # контрольные цифры для самопроверки (могут поплыть с обновлением игры — тогда предупреждаем)
 EXPECT_F55_MATERIALS = 666
-EXPECT_F55_PARTS = 967
+EXPECT_F55_PARTS_OLD = 967   # старый метод: scene_materials ∩ F55 (для регресс-контроля)
+
+WALK_DEPTH_MAX = 10          # предохранитель рекурсии REFERENCE
+
+# деревья meshwork (ночной прогон): entity-резолвленные материалы деталей корвета/
+# фрейтера/диагональных стен, до которых обход сцен не дотягивается (реальный меш
+# за GcBasePlacementRule → PartID → partstable, а не за REFERENCE). Переиспользуем
+# готовый резолвер meshwork через его выход, НЕ форкая его.
+DEF_TREES = r"C:\Users\User\Desktop\MESHWORK_STAGING\_ВСЕ_ДЕТАЛИ\trees"
 
 
 # ------------------------------------------------------------------ HGPAK
@@ -217,6 +239,210 @@ def material_layer(mxml_path):
     return None, "рантайм: отделка из UserData байт 3 (в материале юниформы нет)"
 
 
+# ------------------------------------------------------------------ разбор сцен/материалов из MXML
+# (для файлов, которых нет в графе индексатора — допарсиваем сами, 1:1 из игры)
+
+# пары "Name=MATERIAL/SCENEGRAPH → Value=путь" в атрибутах узлов сцены
+SCENE_PAIR_RE = re.compile(
+    r'name="Name" value="(MATERIAL|SCENEGRAPH)"\s*/>\s*<Property name="Value" value="([^"]*)"')
+
+# сэмплеры материала: Name=g*Map → Map=путь DDS (до 200 симв. между полями)
+MAT_SAMPLER_RE = re.compile(
+    r'name="Name" value="(g\w+)"[\s\S]{0,200}?name="Map" value="([^"]*)"')
+
+
+def parse_scene_mxml(path):
+    """Декодированная сцена → (set материалов norm, set REFERENCE-сцен norm)."""
+    try:
+        with open(_long(path), "r", encoding="utf-8", errors="replace") as fh:
+            txt = fh.read()
+    except OSError:
+        return set(), set()
+    mats, refs = set(), set()
+    for kind, val in SCENE_PAIR_RE.findall(txt):
+        if not val:
+            continue
+        if kind == "MATERIAL":
+            mats.add(norm(val))
+        else:
+            refs.add(norm(val))
+    return mats, refs
+
+
+def tree_multitex_materials(tree_dir, oid):
+    """Из дерева meshwork <ID>.json — материалы детали с флагом _F55_MULTITEXTURE
+    (система отделки игры). Возвращает {mat_norm: {class,diffuse,diffuse_layers}} или
+    {} если дерева нет. Данные дерева игро-производны (meshwork декодировал материалы
+    из паков) — доверяем его флагам/слоям без пере-декода. Слоёный атлас БЕЗ _F55
+    (световой куки) финишем НЕ считаем — как и в material_multitex."""
+    if not tree_dir:
+        return {}
+    fp = os.path.join(tree_dir, oid + ".json")
+    if not os.path.isfile(_long(fp)):
+        return {}
+    try:
+        with open(_long(fp), "r", encoding="utf-8") as fh:
+            tree = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for mk, m in (tree.get("materials") or {}).items():
+        flags = m.get("flags") or []
+        if MULTITEX_FLAG not in flags:
+            continue
+        layers = 0
+        diffuse = ""
+        for s in m.get("samplers") or []:
+            ly = s.get("layers") or 1
+            if ly > layers:
+                layers = ly
+            if s.get("name") == "gDiffuseMap":
+                diffuse = s.get("map", "")
+        out[norm(mk)] = {
+            "class": m.get("class", ""),
+            "diffuse": diffuse,
+            "diffuse_layers": layers or None,
+            "flags_f55": True,
+        }
+    return out
+
+
+TABLE_PARTS = "metadata/reality/tables/basebuildingpartstable.mbin"
+_PT_ID_RE = re.compile(r'<Property name="ID" value="(_[^"]+)"')
+_PT_FN_RE = re.compile(r'<Property name="Filename" value="([^"]+\.SCENE\.MBIN)"', re.I)
+# ATTACHMENT в placement-сцене: путь к *.ENTITY.MBIN
+_SCENE_ATT_RE = re.compile(
+    r'name="Name" value="ATTACHMENT" />\s*\n\s*<Property name="Value" value="([^"]+\.ENTITY\.MBIN)"', re.I)
+
+
+def parse_partstable(mxml):
+    """partstable.MXML -> {part_id_lower: set(сцен norm)}. part_id вида '_WALLB'."""
+    with open(_long(mxml), "r", encoding="utf-8", errors="replace") as fh:
+        txt = fh.read()
+    ids = [(m.group(1), m.start()) for m in _PT_ID_RE.finditer(txt)]
+    out = {}
+    for i, (pid, pos) in enumerate(ids):
+        end = ids[i + 1][1] if i + 1 < len(ids) else len(txt)
+        scenes = set(norm(f) for f in _PT_FN_RE.findall(txt[pos:end]))
+        if scenes:
+            out.setdefault(pid.lower(), set()).update(scenes)
+    return out
+
+
+def placement_rule_partids(placement_scene, raw, pcbanks, manifest, mbin_exe):
+    """PartID сборки детали-КОМНАТЫ из GcBasePlacementRule entity placement-сцены.
+    Возвращает [] если это НЕ сборка (правила на ОДНОМ локаторе = подмена одной детали,
+    напр. стена _WALLB→дверь при стыковке — такие берёт резолвер meshwork/дерево, не мы).
+    Сборка (комната фрейтера/корвет-хаб) = правила на РАЗНЫХ локаторах (пол+стены+углы) —
+    возвращаем PartID ВСЕХ (весь набор комнаты). Зеркально дискриминатору meshwork."""
+    mx = re.sub(r"\.mbin(\.pc)?$", ".MXML",
+                os.path.join(raw, norm(placement_scene).replace("/", os.sep)), flags=re.I)
+    if not os.path.isfile(_long(mx)):
+        mb = extract_one(pcbanks, manifest, placement_scene, raw)
+        mx = decode_one(mbin_exe, mb) if mb else None
+    if not mx or not os.path.isfile(_long(mx)):
+        return []
+    stxt = open(_long(mx), "r", encoding="utf-8", errors="replace").read()
+    att = _SCENE_ATT_RE.findall(stxt)
+    if not att:
+        return []
+    emx = re.sub(r"\.mbin(\.pc)?$", ".MXML",
+                 os.path.join(raw, norm(att[0]).replace("/", os.sep)), flags=re.I)
+    if not os.path.isfile(_long(emx)):
+        mb = extract_one(pcbanks, manifest, att[0], raw)
+        emx = decode_one(mbin_exe, mb) if mb else None
+    if not emx or not os.path.isfile(_long(emx)):
+        return []
+    etxt = open(_long(emx), "r", encoding="utf-8", errors="replace").read()
+    rules = []
+    for block in re.split(r'value="GcBasePlacementRule"', etxt)[1:]:
+        pm = re.search(r'<Property name="PartID" value="([^"]+)"', block)
+        lm = re.search(r'<Property name="PositionLocator" value="([^"]*)"', block)
+        if pm:
+            rules.append((pm.group(1), lm.group(1) if lm else ""))
+    if len({loc for _p, loc in rules}) <= 1:
+        return []   # одно-локаторная подмена — не сборка
+    return [p for p, _loc in rules]
+
+
+def strip_placement(scene):
+    """'..._placement.scene.mbin' -> '....scene.mbin' (базовая сцена с реальными мешами).
+    Проверено 07.07.2026: у части деталей (окна, диагональные стены-варианты, флаги,
+    силосы, деревья-анализаторы) базовой сцены без _placement НЕТ, тогда strip
+    ничего не добавит; но там где она есть — там и лежит настоящая геометрия/материалы.
+    Тот же приём у резолвера meshwork ('извлечь базовую минус _placement')."""
+    return re.sub(r"_placement(\.scene\.mbin)$", r"\1", scene, flags=re.I)
+
+
+def parse_material_mxml(path):
+    """Декодированный материал → {'flags_f55': bool, 'samplers': [{'name','map'}]}."""
+    try:
+        with open(_long(path), "r", encoding="utf-8", errors="replace") as fh:
+            txt = fh.read()
+    except OSError:
+        return None
+    return {
+        "flags_f55": MULTITEX_FLAG in txt,
+        "samplers": [{"name": n, "map": m} for n, m in MAT_SAMPLER_RE.findall(txt) if m],
+    }
+
+
+class SceneWalker(object):
+    """Рекурсивный сбор материалов детали по сценам.
+    Источник графа — parts_links['scenes'] (meshes/references); сцены вне графа
+    допарсиваются из raw (при необходимости извлекаются из паков и декодируются)."""
+
+    def __init__(self, db_scenes, raw, pcbanks, manifest, mbin_exe):
+        self.db_scenes = db_scenes
+        self.raw = raw
+        self.pcbanks = pcbanks
+        self.manifest = manifest
+        self.mbin = mbin_exe
+        self.cache = {}          # scene_norm -> (frozenset mats, frozenset refs)
+        self.n_extra_parsed = 0  # сцен допарсено из MXML (вне графа индексатора)
+        self.n_missing = 0       # сцен не найдено нигде
+
+    def scene_info(self, sn):
+        if sn in self.cache:
+            return self.cache[sn]
+        rec = self.db_scenes.get(sn)
+        if rec is not None:
+            mats = frozenset(norm(m["material"]) for m in rec.get("meshes") or []
+                             if m.get("material"))
+            refs = frozenset(norm(r["scene"]) for r in rec.get("references") or []
+                             if r.get("scene"))
+        else:
+            mxml = re.sub(r"\.mbin(\.pc)?$", ".MXML",
+                          os.path.join(self.raw, sn.replace("/", os.sep)), flags=re.I)
+            if not os.path.isfile(_long(mxml)):
+                mb = extract_one(self.pcbanks, self.manifest, sn, self.raw)
+                mxml = decode_one(self.mbin, mb) if mb else None
+            if mxml and os.path.isfile(_long(mxml)):
+                m, r = parse_scene_mxml(mxml)
+                mats, refs = frozenset(m), frozenset(r)
+                self.n_extra_parsed += 1
+            else:
+                mats, refs = frozenset(), frozenset()
+                self.n_missing += 1
+        self.cache[sn] = (mats, refs)
+        return self.cache[sn]
+
+    def collect(self, seed_scenes):
+        """Все материалы, достижимые из seed-сцен по REFERENCE (глубина ≤ WALK_DEPTH_MAX)."""
+        out, seen = set(), set()
+        frontier = [(norm(s), 0) for s in seed_scenes if s]
+        while frontier:
+            sn, d = frontier.pop()
+            if sn in seen or d > WALK_DEPTH_MAX:
+                continue
+            seen.add(sn)
+            mats, refs = self.scene_info(sn)
+            out |= mats
+            for r in refs:
+                frontier.append((r, d + 1))
+        return out
+
+
 # ------------------------------------------------------------------ objectstable: дефолты
 # стриминг-читалка записей — КОПИЯ по образцу nms_indexer.py
 
@@ -263,6 +489,9 @@ def main():
     ap.add_argument("--pcbanks", default="", help="папка PCBANKS (по умолчанию из parts_links.json)")
     ap.add_argument("--mbin", default=DEF_MBIN, help="путь к MBINCompiler.exe")
     ap.add_argument("--out", default="", help="куда писать (по умолчанию <index>\\finish_layers.json)")
+    ap.add_argument("--trees", default=None,
+                    help="папка деревьев meshwork для добора entity-цепочки "
+                         "(по умолчанию ночной прогон; '' — отключить)")
     args = ap.parse_args()
 
     links_path = os.path.join(args.index, "parts_links.json")
@@ -288,30 +517,83 @@ def main():
     print("    материалов всего: %d, с %s: %d (самопроверка: %d)"
           % (len(mats), MULTITEX_FLAG, len(f55), EXPECT_F55_MATERIALS))
 
-    # --- 2: атласы — уникальные текстуры всех сэмплеров F55-материалов + число слоёв
-    print("[2] читаю заголовки DDS атласов из паков...")
-    want_dds = {}
-    for v in f55.values():
-        for s in v.get("samplers") or []:
-            if s.get("map"):
-                want_dds.setdefault(norm(s["map"]), s["map"])
-    # полнота: мультитекстурные пути у материалов БЕЗ флага F55 (не должно быть — проверяем)
-    no_flag_users = sorted(
-        k for k, v in mats.items()
-        if "error" not in v and MULTITEX_FLAG not in (v.get("flags") or [])
-        and any("multitextures/" in norm(s.get("map", "")) for s in v.get("samplers") or []))
+    # --- 2: атласы (лениво): текстура → инфо заголовка DDS из паков
+    print("[2] читаю заголовки DDS атласов из паков (по мере надобности)...")
     atlases = {}
-    for key in sorted(want_dds):
+
+    def atlas_info(map_path):
+        key = norm(map_path)
+        if key in atlases:
+            return atlases[key]
         rec = manifest.get(key)
         if rec is None:
             atlases[key] = {"error": "нет в паках"}
-            continue
-        head = get_pak(pcbanks, rec["pak"]).read_head(rec["index"], 256)
-        info = dds_info(head)
-        atlases[key] = info if info else {"error": "не DDS"}
+        else:
+            head = get_pak(pcbanks, rec["pak"]).read_head(rec["index"], 256)
+            info = dds_info(head)
+            atlases[key] = info if info else {"error": "не DDS"}
+        return atlases[key]
+
+    def atlas_layers(map_path):
+        return atlas_info(map_path).get("layers", 1) or 1
+
+    # заголовки всех сэмплеров F55-материалов (как раньше)
+    for v in f55.values():
+        for s in v.get("samplers") or []:
+            if s.get("map"):
+                atlas_info(s["map"])
     n_multi = sum(1 for a in atlases.values() if a.get("layers", 1) > 1)
     print("    уникальных текстур у F55-материалов: %d, из них массивов (слоёв>1): %d"
           % (len(atlases), n_multi))
+
+    # --- 2б: признак «мультитекстурный материал»: флаг _F55 ИЛИ фактический слоёный атлас
+    mat_extra_cache = {}   # материалы вне базы индексатора: path_norm -> parsed|None
+    n_mat_extra_parsed = 0
+
+    def material_record(mk):
+        """Запись материала: из базы индексатора или допарсенная из MXML."""
+        v = mats.get(mk)
+        if v is not None and "error" not in v:
+            return {"flags_f55": MULTITEX_FLAG in (v.get("flags") or []),
+                    "samplers": v.get("samplers") or [],
+                    "class": v.get("class", "")}
+        if mk in mat_extra_cache:
+            return mat_extra_cache[mk]
+        mxml = re.sub(r"\.mbin(\.pc)?$", ".MXML",
+                      os.path.join(raw, mk.replace("/", os.sep)), flags=re.I)
+        if not os.path.isfile(_long(mxml)):
+            mb = extract_one(pcbanks, manifest, mk, raw)
+            mxml = decode_one(args.mbin, mb) if mb else None
+        parsed = parse_material_mxml(mxml) if mxml else None
+        if parsed is not None:
+            parsed["class"] = ""
+            nonlocal_counter["extra_mats"] += 1
+        mat_extra_cache[mk] = parsed
+        return parsed
+
+    nonlocal_counter = {"extra_mats": 0}
+    multitex_verdict = {}   # mk -> "f55" | None (финиш-мультитекстура = флаг _F55)
+    array_no_f55_mats = set()  # слоёный атлас БЕЗ _F55 (световой куки и т.п.) — НЕ финиш
+
+    def material_multitex(mk):
+        """Финиш-мультитекстура детали = материал с флагом _F55_MULTITEXTURE (система
+        отделки игры: gfMultiTextureIndex по слою). Слоёный атлас БЕЗ _F55 (напр.
+        light.material — световой куки COOKIE.DDS) отделкой НЕ является — фиксируем в
+        array_no_f55_mats информационно, но деталь им мультитекстурной НЕ помечаем."""
+        if mk in multitex_verdict:
+            return multitex_verdict[mk]
+        r = material_record(mk)
+        verdict = None
+        if r is not None:
+            if r["flags_f55"]:
+                verdict = "f55"
+            else:
+                for s in r["samplers"]:
+                    if s.get("map") and atlas_layers(s["map"]) > 1:
+                        array_no_f55_mats.add(mk)
+                        break
+        multitex_verdict[mk] = verdict
+        return verdict
 
     # --- 3: слой per-материал (юниформа в .MATERIAL.MXML или рантайм)
     print("[3] проверяю юниформу %s в %d материалах..." % (UNIFORM_NAME, len(f55)))
@@ -357,11 +639,85 @@ def main():
     defaults = parse_defaults(obj_mxml)
     print("    деталей с непустой отделкой/палитрой по умолчанию: %d" % len(defaults))
 
-    # --- 5: свод по деталям (какие F55-материалы использует деталь)
+    # --- 4б: partstable для резолвера СБОРКИ (комнаты фрейтера/корвета за entity-правилами)
+    part_mbin = os.path.join(raw, TABLE_PARTS.replace("/", os.sep))
+    if not os.path.isfile(part_mbin):
+        part_mbin = extract_one(pcbanks, manifest, TABLE_PARTS, raw)
+    part_mxml = decode_one(args.mbin, part_mbin) if part_mbin else None
+    partstable = parse_partstable(part_mxml) if part_mxml else {}
+    print("    partstable: part_id со сценами: %d" % len(partstable))
+
+    # --- 5: свод по деталям — РЕКУРСИВНЫЙ сбор материалов сцен (добор 07.07.2026)
+    trees_dir = args.trees if args.trees is not None else DEF_TREES
+    have_trees = bool(trees_dir) and os.path.isdir(trees_dir)
+    print("[5] обход сцен деталей (стили+сцена+placement+strip _placement+REFERENCE)%s..."
+          % (" + деревья meshwork" if have_trees else " (деревьев meshwork нет — пропуск)"))
+    walker = SceneWalker(db.get("scenes") or {}, raw, pcbanks, manifest, args.mbin)
     parts_out = {}
+    n_mt_parts_old = 0   # старый метод (scene_materials ∩ F55) — регресс-контроль
     n_mt_parts = 0
-    for oid, rec in (db.get("parts") or {}).items():
-        mt = sorted(norm(m) for m in rec.get("scene_materials") or [] if norm(m) in f55)
+    gained_walk = []     # получили мультитекстуру только обходом сцен (strip/REFERENCE)
+    gained_tree = []     # получили только из дерева meshwork (entity-цепочка)
+    gained_asm = []      # получили только резолвером СБОРКИ по entity-правилам
+    for oid, rec in sorted((db.get("parts") or {}).items()):
+        base = set(norm(m) for m in rec.get("scene_materials") or [])
+        old_mt = sorted(m for m in base if m in f55)
+        if old_mt:
+            n_mt_parts_old += 1
+        seeds = list((rec.get("styles") or {}).values())
+        if rec.get("scene"):
+            seeds.append(rec["scene"])
+        pl = (rec.get("object") or {}).get("PlacementScene")
+        if pl:
+            seeds.append(pl)
+        # strip _placement: базовая сцена с реальными мешами (там где она есть)
+        for s in list(seeds):
+            if s and norm(s) != norm(strip_placement(s)):
+                seeds.append(strip_placement(s))
+        walked = walker.collect(seeds)
+        all_mats = base | walked
+        mt, mt_kinds = [], {}
+        for m in sorted(all_mats):
+            kind = material_multitex(m)
+            if kind:
+                mt.append(m)
+                mt_kinds[m] = kind
+        got_by_walk = bool(mt)
+        # добор из дерева meshwork (entity-резолвленные материалы корвета/фрейтера/диагоналей)
+        tree_src = []
+        if have_trees:
+            for mk, info in tree_multitex_materials(trees_dir, oid).items():
+                if mk not in mt_kinds:
+                    mt.append(mk)
+                    mt_kinds[mk] = "f55" if info["flags_f55"] else "array"
+                    tree_src.append(mk)
+                    if mk not in out_mats:
+                        out_mats[mk] = {
+                            "class": info["class"],
+                            "diffuse": info["diffuse"],
+                            "diffuse_layers": info["diffuse_layers"],
+                            "layer": None,
+                            "layer_source": "рантайм (UserData байт 3); материал из дерева meshwork (entity-цепочка)",
+                            "from_tree": True,
+                        }
+            mt = sorted(set(mt))
+        # FALLBACK: резолвер СБОРКИ по entity-правилам — для деталей-комнат (фрейтер/
+        # корвет-хаб), чей меш собран из под-частей за GcBasePlacementRule, а не за
+        # REFERENCE (обход сцен и деревья meshwork их не берут — meshwork даёт «ПУСТО»).
+        # Только когда обход+дерево ничего не дали (не трогает уже решённые детали).
+        asm_src = []
+        if not mt and pl and partstable:
+            asm_scenes = set()
+            for pid in placement_rule_partids(pl, raw, pcbanks, manifest, args.mbin):
+                asm_scenes |= partstable.get(pid.lower(), set())
+            if asm_scenes:
+                for m in sorted(walker.collect(list(asm_scenes))):
+                    kind = material_multitex(m)
+                    if kind and m not in mt_kinds:
+                        mt.append(m)
+                        mt_kinds[m] = kind
+                        asm_src.append(m)
+                mt = sorted(set(mt))
         d = defaults.get(oid)
         if not mt and not d:
             continue
@@ -370,14 +726,34 @@ def main():
             entry.update(d)
         if mt:
             entry["multitexture_materials"] = mt
+            if tree_src:
+                entry["from_meshwork_tree"] = sorted(tree_src)
+            if asm_src:
+                entry["from_entity_assembly"] = sorted(asm_src)
             n_mt_parts += 1
+            if not old_mt:
+                if got_by_walk:
+                    gained_walk.append(oid)
+                elif tree_src:
+                    gained_tree.append(oid)
+                else:
+                    gained_asm.append(oid)
         parts_out[oid] = entry
     # детали из objectstable, которых нет в parts_links (не должно быть, но не терять)
     for oid, d in defaults.items():
         if oid not in parts_out:
             parts_out[oid] = dict(d)
-    print("    деталей с мультитекстурным материалом: %d (самопроверка: %d)"
-          % (n_mt_parts, EXPECT_F55_PARTS))
+    print("    старый метод: %d деталей (самопроверка: %d); с добором: %d (+%d обходом сцен, +%d из деревьев, +%d сборкой entity)"
+          % (n_mt_parts_old, EXPECT_F55_PARTS_OLD, n_mt_parts,
+             len(gained_walk), len(gained_tree), len(gained_asm)))
+    print("    сцен допарсено вне графа: %d, не найдено: %d, материалов допарсено: %d"
+          % (walker.n_extra_parsed, walker.n_missing, nonlocal_counter["extra_mats"]))
+
+    # материалы-«массивы без _F55» (световой куки и т.п.): деталями НЕ считаются
+    # финиш-мультитекстурой (система отделки требует флага _F55), фиксируем списком
+    array_no_f55 = sorted(array_no_f55_mats)
+
+    n_multi_total = sum(1 for a in atlases.values() if a.get("layers", 1) > 1)
 
     # --- запись
     result = {
@@ -386,11 +762,18 @@ def main():
             "materials_f55": len(f55),
             "materials_layer_uniform": n_uniform,
             "materials_layer_runtime": n_runtime,
+            "materials_array_no_f55": array_no_f55,
+            "parts_multitexture_old_method": n_mt_parts_old,
             "parts_multitexture": n_mt_parts,
+            "parts_gained_by_scene_walk": gained_walk,
+            "parts_gained_by_meshwork_tree": gained_tree,
+            "parts_gained_by_entity_assembly": gained_asm,
             "parts_with_defaults": len(defaults),
             "atlases_total": len(atlases),
-            "atlases_arrays": n_multi,
-            "non_f55_multitexture_users": no_flag_users,
+            "atlases_arrays": n_multi_total,
+            "scenes_parsed_extra": walker.n_extra_parsed,
+            "scenes_missing": walker.n_missing,
+            "trees_dir": trees_dir if have_trees else None,
         },
         "atlases": atlases,
         "materials": out_mats,
@@ -411,13 +794,16 @@ def main():
     warn = []
     if len(f55) != EXPECT_F55_MATERIALS:
         warn.append("F55-материалов %d (ожидалось %d)" % (len(f55), EXPECT_F55_MATERIALS))
-    if n_mt_parts != EXPECT_F55_PARTS:
-        warn.append("мультитекстурных деталей %d (ожидалось %d)" % (n_mt_parts, EXPECT_F55_PARTS))
-    if no_flag_users:
-        warn.append("материалы БЕЗ %s ссылаются на MULTITEXTURES: %d шт (см. _summary)"
-                    % (MULTITEX_FLAG, len(no_flag_users)))
+    if n_mt_parts_old != EXPECT_F55_PARTS_OLD:
+        warn.append("старый метод дал %d деталей (ожидалось %d) — регресс сбора scene_materials?"
+                    % (n_mt_parts_old, EXPECT_F55_PARTS_OLD))
+    if array_no_f55:
+        warn.append("материалов со слоёным атласом БЕЗ %s: %d (слой не определён — см. materials)"
+                    % (MULTITEX_FLAG, len(array_no_f55)))
     if n_nomxml:
         warn.append("не извлеклись/не декодировались: %d материалов" % n_nomxml)
+    if walker.n_missing:
+        warn.append("сцены не найдены ни в графе, ни в паках: %d" % walker.n_missing)
     for w in warn:
         print("  !! " + w)
     if not warn:

@@ -395,6 +395,71 @@ def parse_scene(scene_file):
     }
 
 
+# ---------------------------------------------------------------- эмуляция шейдера
+# Числовой «портрет пикселя» материала — что убершейдер игры сделает с этим материалом.
+# Формулы 1:1 из проверенной заметки 6_LOGIC_NOTES\ИССЛЕДОВАНИЕ_ДЕТАЛИ_2026-07\10_ATLAS_KRASKA
+# (frag 22517998153629701, адверсарно сверено на 4337 материалах). Точнее симулятора
+# NMS_АТЛАС_ИСТИНА: несёт Subsurface (masks.A·Params.y) и правку применения AO (лерп ambient).
+
+# бит gDynamicFlags.x -> активная ветка (проверено по GLSL, стр.152-170 заметки 10)
+DYNBITS = {
+    1:    "Roughness = (1−masks.R)·Params.x  (иначе 1·Params.x)",
+    2:    "Metallic = masks.G  (иначе Params.z)",
+    8:    "Glow-маска = masks.B  (иначе 1)",
+    64:   "AO = gOcclusionMap.G",
+    256:  "★ покраска: zone = 4−int(cmask.R·4+0.5), albedo·=свотч[zone]",
+    2048: "AO ограничен вершинным цветом.w (min)",
+    8192: "Glow-сила = Params2.x",
+}
+
+
+def _f(vals, i, default=0.0):
+    try:
+        return float(vals[i])
+    except (TypeError, ValueError, IndexError):
+        return default
+
+
+def emulate_shader(flags, uniforms):
+    """Возвращает dict: активные биты + формулы Roughness/Metallic/Glow/Subsurface/AO/zone
+    с подставленными числами материала. Всё 1:1 из GLSL (см. заметку 10)."""
+    fl = set(flags or [])
+    dynx = 0
+    dv = uniforms.get("gDynamicFlags")
+    if dv:
+        try:
+            dynx = int(float(dv[0])) if dv[0] not in (None, "") else 0
+        except (TypeError, ValueError):
+            dynx = 0
+    P = uniforms.get("gMaterialParamsVec4") or []
+    P2 = uniforms.get("gMaterialParams2Vec4") or []
+    px, py, pz = _f(P, 0, 0.9), _f(P, 1, 0.5), _f(P, 2, 0.0)
+    has_masks = "_F25_MASKS_MAP" in fl
+    out = {
+        "dyn_x": dynx,
+        "active_bits": [(b, d) for b, d in sorted(DYNBITS.items()) if dynx & b],
+        "roughness": ("clamp((1−masks.R)·%.2f)" % px) if (dynx & 1) else ("clamp(1·%.2f)=%.2f" % (px, min(px, 1.0))),
+        "metallic": "masks.G" if (dynx & 2) else ("Params.z=%.2f" % pz),
+    }
+    if dynx & 8192:
+        gmask = "masks.B" if (dynx & 8) else "1"
+        out["glow"] = "clamp(%s·Params2.x=%.2f, 0..4)" % (gmask, _f(P2, 0, 0.0))
+    else:
+        out["glow"] = "0 (выключено)"
+    # Subsurface — наша ключевая находка: masks.A НЕ AO, а подповерхностное свечение
+    out["subsurface"] = ("masks.A·Params.y=%.2f" % py) if has_masks else "нет masks-карты"
+    out["ao"] = "gOcclusionMap.G" + ("  (min с вершинным.w)" if (dynx & 2048) else "") if (dynx & 64) else "1.0 (нет AO-карты)"
+    if dynx & 256:
+        out["paint"] = "zone = 4−int(cmask.R·4+0.5); zone<4 → albedo·=свотч палитры[zone] (без своей cmask: R=126 → зона 2 целиком)"
+    else:
+        out["paint"] = "не красится (бит 256 выкл)"
+    out["is_multitexture"] = "_F55_MULTITEXTURE" in fl
+    out["is_glass"] = "_F30_REFRACTION" in fl
+    out["is_unlit"] = "_F07_UNLIT" in fl
+    out["uv2"] = ("_F16_DIFFUSE2MAP" in fl) or ("_F42_DETAIL_NORMAL" in fl)
+    return out
+
+
 def parse_material(mat_path_game):
     """Материал по игровому пути: полное имя (MATERIALS/NEW_EXTRACT) ->
     короткое имя (META_NEW, с предупреждением о коллизиях)."""
@@ -418,28 +483,38 @@ def parse_material(mat_path_game):
     txt_flags, samplers = [], []
     mclass = ""
     colour = None
+    uniforms = {}   # имя юниформы -> [X,Y,Z,W] (Float + UInt: Params/Params2/DynamicFlags)
     root = tree.getroot()
+
+    def _xyzw(el):
+        # X/Y/Z/W лежат под под-свойством "Values" (не прямые дети юниформы)
+        p = et_props(el)
+        holder = p["Values"][0] if "Values" in p else el
+        vp = et_props(holder)
+        return [vp[k][0].get("value") if k in vp else None for k in ("X", "Y", "Z", "W")]
 
     def rec(el):
         nonlocal mclass, colour
         name = el.get("name")
+        val = el.get("value") or ""
         if name == "MaterialFlag":
             txt_flags.append(el.get("value"))
         elif name == "MaterialClass":
             mclass = el.get("value")
-        elif name == "Samplers" and el.get("value") == "TkMaterialSampler":
+        elif name == "Samplers" and val == "TkMaterialSampler":
             p = et_props(el)
             samplers.append({
                 "Name": p["Name"][0].get("value") if "Name" in p else "",
                 "Map": p["Map"][0].get("value") if "Map" in p else "",
                 "IsSRGB": p["IsSRGB"][0].get("value") if "IsSRGB" in p else "",
             })
-        elif (name == "Uniforms_Float" and el.get("value") == "TkMaterialUniform_Float"):
+        elif name in ("Uniforms_Float", "Uniforms_UInt") and val.startswith("TkMaterialUniform"):
             p = et_props(el)
             un = p["Name"][0].get("value") if "Name" in p else ""
-            if un == "gMaterialColourVec4":
-                vals = re.findall(r'value="([-\d.]+)"', ET.tostring(el, encoding="unicode"))
-                colour = vals[1:5] if len(vals) > 4 else vals
+            if un:
+                uniforms[un] = _xyzw(el)
+                if un == "gMaterialColourVec4":
+                    colour = uniforms[un]
         for c in el:
             rec(c)
 
@@ -451,6 +526,8 @@ def parse_material(mat_path_game):
         "Class": mclass,
         "Flags": txt_flags,
         "gMaterialColourVec4": colour,
+        "Uniforms": uniforms,
+        "Shader": emulate_shader(txt_flags, uniforms),
         "Samplers": samplers,
     }
 
@@ -710,6 +787,27 @@ def fmt_report(r):
                 L.append("    gMaterialColourVec4 = %s" % m["gMaterialColourVec4"])
             for s in m.get("Samplers", []):
                 L.append("    %-18s sRGB=%-5s %s" % (s["Name"], s["IsSRGB"], s["Map"]))
+            se = m.get("Shader")
+            if se:
+                L.append("    ── ЭМУЛЯЦИЯ ШЕЙДЕРА (что убершейдер сделает с пикселем; gDynamicFlags.x=0x%X) ──" % se.get("dyn_x", 0))
+                L.append("      Roughness   : %s" % se.get("roughness"))
+                L.append("      Metallic    : %s" % se.get("metallic"))
+                L.append("      Glow        : %s" % se.get("glow"))
+                L.append("      Subsurface  : %s" % se.get("subsurface"))
+                L.append("      AO          : %s" % se.get("ao"))
+                L.append("      Покраска    : %s" % se.get("paint"))
+                tags = []
+                if se.get("is_multitexture"): tags.append("мультитекстура-отделка (F55, слой=UserData байт3)")
+                if se.get("is_glass"): tags.append("стекло (F30, 5-й сэмплер gRefractionMap)")
+                if se.get("is_unlit"): tags.append("unlit")
+                if se.get("uv2"): tags.append("2-й UV-комплект (F16/F42)")
+                if tags:
+                    L.append("      Особое      : " + "; ".join(tags))
+                bits = se.get("active_bits") or []
+                if bits:
+                    L.append("      Активные биты gDynamicFlags.x:")
+                    for b, d in bits:
+                        L.append("        0x%-5X %s" % (b, d))
 
     hulls = r.get("hulls")
     if hulls:
