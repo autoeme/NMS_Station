@@ -63,11 +63,12 @@ T = {
  "pcbanks": "Папка PCBANKS (.pak):", "out": "Папка результата:", "mbin": "MBINCompiler.exe:",
  "browse": "Обзор…", "index_all": "ИНДЕКСИРОВАТЬ ВСЁ", "tables_only": "только таблицы",
  "limit": "  лимит деталей:", "oid": "ObjectID:", "style": "стиль:",
- "passport": "ПАСПОРТ ДЕТАЛИ", "stop": "СТОП", "clear": "Очистить",
+ "passport": "ПАСПОРТ ДЕТАЛИ", "passport_all": "ВСЕ ПАСПОРТА", "stop": "СТОП", "clear": "Очистить",
  "open_result": "Открыть результат", "icon_panel": "ИКОНКА ДЕТАЛИ",
  "gallery_btn": "ГАЛЕРЕЯ — все иконки", "lang": "Язык:",
  "ready_init": "Готов. Укажи пути и жми кнопку.", "ready": "Готов.",
- "busy": "%s — выполняется...", "task_index": "Индексация %s", "task_lookup": "Паспорт детали %s",
+ "busy": "%s — выполняется...", "task_index": "Индексация %s", "task_lookup": "Паспорт детали %s", "task_lookup_all": "Паспорта всех деталей",
+ "no_outdir_pp": "!! Укажи «Папку результата» — туда сложится отчёт passports\\.",
  "already": "! Уже идёт задача — дождись или нажми СТОП.",
  "fail_start": "!! не запустилось: %s", "done": "<<< завершено, код %d",
  "stopped": "(остановлено пользователем)", "no_pcbanks": "!! Нет папки PCBANKS: %s",
@@ -102,11 +103,12 @@ T = {
  "pcbanks": "PCBANKS folder (.pak):", "out": "Output folder:", "mbin": "MBINCompiler.exe:",
  "browse": "Browse…", "index_all": "INDEX EVERYTHING", "tables_only": "tables only",
  "limit": "  parts limit:", "oid": "ObjectID:", "style": "style:",
- "passport": "PART PASSPORT", "stop": "STOP", "clear": "Clear",
+ "passport": "PART PASSPORT", "passport_all": "ALL PASSPORTS", "stop": "STOP", "clear": "Clear",
  "open_result": "Open output", "icon_panel": "PART ICON",
  "gallery_btn": "GALLERY — all icons", "lang": "Language:",
  "ready_init": "Ready. Set the paths and press a button.", "ready": "Ready.",
- "busy": "%s — running...", "task_index": "Indexing %s", "task_lookup": "Part passport %s",
+ "busy": "%s — running...", "task_index": "Indexing %s", "task_lookup": "Part passport %s", "task_lookup_all": "Passports for all parts",
+ "no_outdir_pp": "!! Set the «Result folder» — the passports\\ report goes there.",
  "already": "! A task is already running — wait or press STOP.",
  "fail_start": "!! failed to start: %s", "done": "<<< finished, exit code %d",
  "stopped": "(stopped by user)", "no_pcbanks": "!! PCBANKS folder not found: %s",
@@ -141,11 +143,12 @@ T = {
  "pcbanks": "PCBANKS-Ordner (.pak):", "out": "Ausgabeordner:", "mbin": "MBINCompiler.exe:",
  "browse": "Durchsuchen…", "index_all": "ALLES INDEXIEREN", "tables_only": "nur Tabellen",
  "limit": "  Teile-Limit:", "oid": "ObjectID:", "style": "Stil:",
- "passport": "TEIL-STECKBRIEF", "stop": "STOPP", "clear": "Leeren",
+ "passport": "TEIL-STECKBRIEF", "passport_all": "ALLE STECKBRIEFE", "stop": "STOPP", "clear": "Leeren",
  "open_result": "Ergebnis öffnen", "icon_panel": "TEIL-SYMBOL",
  "gallery_btn": "GALERIE — alle Symbole", "lang": "Sprache:",
  "ready_init": "Bereit. Pfade angeben und Knopf drücken.", "ready": "Bereit.",
- "busy": "%s — läuft...", "task_index": "Indexierung %s", "task_lookup": "Steckbrief %s",
+ "busy": "%s — läuft...", "task_index": "Indexierung %s", "task_lookup": "Steckbrief %s", "task_lookup_all": "Steckbriefe aller Teile",
+ "no_outdir_pp": "!! Setze den «Ergebnisordner» — der passports\\-Bericht landet dort.",
  "already": "! Es läuft bereits eine Aufgabe — warten oder STOPP drücken.",
  "fail_start": "!! Start fehlgeschlagen: %s", "done": "<<< fertig, Code %d",
  "stopped": "(vom Benutzer gestoppt)", "no_pcbanks": "!! PCBANKS-Ordner nicht gefunden: %s",
@@ -176,11 +179,12 @@ T = {
  "pcbanks": "Dossier PCBANKS (.pak) :", "out": "Dossier de sortie :", "mbin": "MBINCompiler.exe :",
  "browse": "Parcourir…", "index_all": "TOUT INDEXER", "tables_only": "tables seulement",
  "limit": "  limite de pièces :", "oid": "ObjectID :", "style": "style :",
- "passport": "FICHE DE PIÈCE", "stop": "STOP", "clear": "Effacer",
+ "passport": "FICHE DE PIÈCE", "passport_all": "TOUTES LES FICHES", "stop": "STOP", "clear": "Effacer",
  "open_result": "Ouvrir le résultat", "icon_panel": "ICÔNE DE PIÈCE",
  "gallery_btn": "GALERIE — toutes les icônes", "lang": "Langue :",
  "ready_init": "Prêt. Indiquez les chemins et cliquez.", "ready": "Prêt.",
- "busy": "%s — en cours...", "task_index": "Indexation %s", "task_lookup": "Fiche de %s",
+ "busy": "%s — en cours...", "task_index": "Indexation %s", "task_lookup": "Fiche de %s", "task_lookup_all": "Fiches de toutes les pièces",
+ "no_outdir_pp": "!! Indique le «Dossier résultat» — le rapport passports\\ y sera créé.",
  "already": "! Une tâche est déjà en cours — attendez ou appuyez sur STOP.",
  "fail_start": "!! échec du lancement : %s", "done": "<<< terminé, code %d",
  "stopped": "(arrêté par l'utilisateur)", "no_pcbanks": "!! Dossier PCBANKS introuvable : %s",
@@ -211,11 +215,12 @@ T = {
  "pcbanks": "PCBANKS 文件夹 (.pak)：", "out": "输出文件夹：", "mbin": "MBINCompiler.exe：",
  "browse": "浏览…", "index_all": "全部索引", "tables_only": "仅表格",
  "limit": "  部件上限：", "oid": "ObjectID：", "style": "风格：",
- "passport": "部件档案", "stop": "停止", "clear": "清空",
+ "passport": "部件档案", "passport_all": "全部档案", "stop": "停止", "clear": "清空",
  "open_result": "打开结果", "icon_panel": "部件图标",
  "gallery_btn": "图库 — 全部图标", "lang": "语言：",
  "ready_init": "就绪。设置路径后点击按钮。", "ready": "就绪。",
- "busy": "%s — 进行中…", "task_index": "正在索引 %s", "task_lookup": "部件档案 %s",
+ "busy": "%s — 进行中…", "task_index": "正在索引 %s", "task_lookup": "部件档案 %s", "task_lookup_all": "全部部件档案",
+ "no_outdir_pp": "!! 请设置「结果文件夹」— passports\\ 报告将保存在那里。",
  "already": "! 已有任务在运行 — 请等待或点击停止。",
  "fail_start": "!! 启动失败：%s", "done": "<<< 已完成，代码 %d",
  "stopped": "（已被用户停止）", "no_pcbanks": "!! 找不到 PCBANKS 文件夹：%s",
@@ -246,11 +251,12 @@ T = {
  "pcbanks": "Carpeta PCBANKS (.pak):", "out": "Carpeta de resultados:", "mbin": "MBINCompiler.exe:",
  "browse": "Examinar…", "index_all": "INDEXAR TODO", "tables_only": "solo tablas",
  "limit": "  límite de piezas:", "oid": "ObjectID:", "style": "estilo:",
- "passport": "FICHA DE PIEZA", "stop": "DETENER", "clear": "Limpiar",
+ "passport": "FICHA DE PIEZA", "passport_all": "TODAS LAS FICHAS", "stop": "DETENER", "clear": "Limpiar",
  "open_result": "Abrir resultados", "icon_panel": "ICONO DE PIEZA",
  "gallery_btn": "GALERÍA — todos los iconos", "lang": "Idioma:",
  "ready_init": "Listo. Indica las rutas y pulsa un botón.", "ready": "Listo.",
- "busy": "%s — en curso...", "task_index": "Indexación %s", "task_lookup": "Ficha de %s",
+ "busy": "%s — en curso...", "task_index": "Indexación %s", "task_lookup": "Ficha de %s", "task_lookup_all": "Fichas de todas las piezas",
+ "no_outdir_pp": "!! Indica la «Carpeta de resultado» — el informe passports\\ se creará ahí.",
  "already": "! Ya hay una tarea en curso — espera o pulsa DETENER.",
  "fail_start": "!! no se pudo iniciar: %s", "done": "<<< terminado, código %d",
  "stopped": "(detenido por el usuario)", "no_pcbanks": "!! Carpeta PCBANKS no encontrada: %s",
@@ -340,7 +346,9 @@ class Station(tk.Tk):
         self.var_style = tk.StringVar(value="")
         ttk.Entry(row, textvariable=self.var_style, width=10).pack(side="left", padx=(2, 4))
         self.btn_lookup = self._reg(ttk.Button(row, command=self.run_lookup), "passport")
-        self.btn_lookup.pack(side="left", padx=(0, 8))
+        self.btn_lookup.pack(side="left", padx=(0, 4))
+        self.btn_lookup_all = self._reg(ttk.Button(row, command=self.run_lookup_all), "passport_all")
+        self.btn_lookup_all.pack(side="left", padx=(0, 8))
 
         self.btn_stop = self._reg(ttk.Button(row, command=self.stop, state="disabled"), "stop")
         self.btn_stop.pack(side="right")
@@ -534,6 +542,7 @@ class Station(tk.Tk):
         self.prog.start(80)
         self.btn_index.configure(state="disabled")
         self.btn_lookup.configure(state="disabled")
+        self.btn_lookup_all.configure(state="disabled")
         if self.btn_mesh is not None:
             self.btn_mesh.configure(state="disabled")
         self.btn_stop.configure(state="normal")
@@ -557,6 +566,7 @@ class Station(tk.Tk):
                     self.status.set(self.t("ready"))
                     self.btn_index.configure(state="normal")
                     self.btn_lookup.configure(state="normal")
+                    self.btn_lookup_all.configure(state="normal")
                     if self.btn_mesh is not None:
                         self.btn_mesh.configure(state="normal")
                     self.btn_stop.configure(state="disabled")
@@ -753,6 +763,20 @@ class Station(tk.Tk):
             args += ["--style", style]
         self._last_task = "lookup"
         self._start(self._child_argv("lookup", args), self.t("task_lookup") % oid)
+
+    def run_lookup_all(self):
+        """Прогон паспорта по ВСЕМ деталям (или первым N по полю «лимит»).
+        Отчёт складывается в <папка результата>\\passports\\ (<ID>.txt + _ВСЕ_ПАСПОРТА.txt)."""
+        out = self.var_out.get().strip()
+        if not os.path.isdir(out):
+            self.log("\n" + self.t("no_outdir_pp") + "\n")
+            return
+        args = ["--all", "--out", out]
+        lim = self.var_limit.get().strip()
+        if lim.isdigit() and int(lim) > 0:
+            args += ["--limit", lim]
+        self._last_task = "lookup"
+        self._start(self._child_argv("lookup", args), self.t("task_lookup_all"))
 
     def local_passport(self, oid):
         """Паспорт детали из проиндексированной базы (портативный режим, без дампов)."""

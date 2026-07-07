@@ -856,16 +856,102 @@ def fmt_report(r):
     return "\n".join(L)
 
 
+def all_object_ids():
+    """Все ObjectID из objectstable (PRECACHE_FULL). Фолбэк — ключи parts_links.json
+    (портативный режим без дампов)."""
+    ids = []
+    if os.path.isfile(OBJECTSTABLE):
+        try:
+            with open(OBJECTSTABLE, "r", encoding="utf-8", errors="replace") as fh:
+                txt = fh.read()
+            ids = re.findall(r'GcBaseBuildingEntry"\s+_id="([^"]+)"', txt)
+        except OSError:
+            ids = []
+    if not ids:
+        # фолбэк: любой parts_links.json рядом (index-папка)
+        for cand in (os.path.join(os.getcwd(), "NMS_INDEX", "parts_links.json"),
+                     os.path.join(os.getcwd(), "parts_links.json")):
+            if os.path.isfile(cand):
+                try:
+                    with open(cand, "r", encoding="utf-8") as fh:
+                        ids = list((json.load(fh).get("parts") or {}).keys())
+                    break
+                except (OSError, ValueError):
+                    pass
+    # уникальные, стабильный порядок
+    seen, out = set(), []
+    for i in ids:
+        u = i.strip().upper()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def run_batch(out_dir, limit=None, brief=False):
+    """Прогон паспорта по ВСЕМ деталям (или первым N): каждый -> passports\\<ID>.txt +
+    общий _ВСЕ_ПАСПОРТА.txt. Прогресс печатается в stdout (виден в GUI Станции)."""
+    ids = all_object_ids()
+    if not ids:
+        print("!! Не удалось получить список деталей (нет objectstable и parts_links.json).")
+        print("   Сначала прогони «ИНДЕКСИРОВАТЬ ВСЁ».")
+        return 1
+    if limit and limit > 0:
+        ids = ids[:limit]
+    pdir = os.path.join(out_dir, "passports")
+    try:
+        os.makedirs(pdir, exist_ok=True)
+    except OSError as e:
+        print("!! Не создать папку отчёта %s: %s" % (pdir, e))
+        return 1
+    print("Прогон паспортов: %d деталей -> %s" % (len(ids), pdir))
+    combined, ok, errs = [], 0, 0
+    for i, oid in enumerate(ids, 1):
+        try:
+            txt = fmt_report(lookup(oid, brief=brief))
+            ok += 1
+        except Exception as e:  # один битый паспорт не роняет прогон
+            txt = "=" * 72 + "\nПАСПОРТ %s: ОШИБКА — %s\n" % (oid, e) + "=" * 72
+            errs += 1
+        try:
+            with open(os.path.join(pdir, re.sub(r'[\\/:*?"<>|]', "_", oid) + ".txt"),
+                      "w", encoding="utf-8") as fh:
+                fh.write(txt)
+        except OSError:
+            pass
+        combined.append(txt)
+        if i % 25 == 0 or i == len(ids):
+            print("  %d/%d" % (i, len(ids)))
+    try:
+        with open(os.path.join(pdir, "_ВСЕ_ПАСПОРТА.txt"), "w", encoding="utf-8") as fh:
+            fh.write("\n\n".join(combined))
+    except OSError:
+        pass
+    print("Готово: %d паспортов (%d ок, %d с ошибкой) в %s" % (len(ids), ok, errs, pdir))
+    print("Общий отчёт: %s" % os.path.join(pdir, "_ВСЕ_ПАСПОРТА.txt"))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Паспорт детали NMS по ObjectID (1:1 из игры)")
-    ap.add_argument("object_id", help="ObjectID (можно с ^): TELEPORTER, _WALLB, W_WALL...")
+    ap.add_argument("object_id", nargs="?", help="ObjectID (можно с ^): TELEPORTER, _WALLB, W_WALL...")
     ap.add_argument("--style", help="стиль (Timber/Stone/Wood/...); по умолчанию из objectstable")
     ap.add_argument("--json", action="store_true", help="вывод JSON вместо отчёта")
     ap.add_argument("--brief", action="store_true", help="без разбора сцены/материалов")
     ap.add_argument("--placement", action="store_true",
                     help="при расхождении сцен разобрать PlacementScene, а не partstable")
+    ap.add_argument("--all", action="store_true", dest="run_all",
+                    help="прогнать паспорт по ВСЕМ деталям (отчёт в <out>\\passports\\)")
+    ap.add_argument("--out", default="", help="папка результата для --all (там создаётся passports\\)")
+    ap.add_argument("--limit", type=int, default=0, help="для --all: только первые N деталей")
     args = ap.parse_args()
 
+    if args.run_all:
+        out = args.out.strip() or os.getcwd()
+        sys.exit(run_batch(out, limit=args.limit, brief=args.brief))
+
+    if not args.object_id:
+        ap.error("нужен ObjectID (или --all для прогона всех деталей)")
     oid = args.object_id.strip().lstrip("^").upper()
     r = lookup(oid, style=args.style, brief=args.brief, use_placement=args.placement)
     if args.json:
