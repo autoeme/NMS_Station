@@ -401,15 +401,20 @@ def parse_scene(scene_file):
 # (frag 22517998153629701, адверсарно сверено на 4337 материалах). Точнее симулятора
 # NMS_АТЛАС_ИСТИНА: несёт Subsurface (masks.A·Params.y) и правку применения AO (лерп ambient).
 
-# бит gDynamicFlags.x -> активная ветка (проверено по GLSL, стр.152-170 заметки 10)
+# бит gDynamicFlags.x -> активная ветка. ПРОВЕРЕНО ПРЯМО ПО ИГРОВОМУ ШЕЙДЕРУ
+# SHADERS_FULL\...\ubershader_frag_lit_defer_22517998153629701.glsl (декомпиляция .spv игры):
+#   бит 1 → _1940 (стр.253), 2 → _1943 (269), 4 → _1947 (285), 8 → _1949 (301),
+#   16 → _1942/subsurface (262), 256 → _1930/покраска (214), 8192 → _1948/glow (292).
 DYNBITS = {
-    1:    "Roughness = (1−masks.R)·Params.x  (иначе 1·Params.x)",
-    2:    "Metallic = masks.G  (иначе Params.z)",
-    8:    "Glow-маска = masks.B  (иначе 1)",
+    1:    "Roughness = (1−masks.R)·Params.x  (иначе 1·Params.x)  [_1940]",
+    2:    "Metallic = masks.G  (иначе Params.z)  [_1943]",
+    4:    "spec/scatter G-буфер.w = masks.G·Params.w  (иначе 0)  [_1947]",
+    8:    "Glow-маска = masks.B  (иначе 1)  [_1949]",
+    16:   "Subsurface из masks.A  (иначе 1·Params.y)  [_1942]",
     64:   "AO = gOcclusionMap.G",
-    256:  "★ покраска: zone = 4−int(cmask.R·4+0.5), albedo·=свотч[zone]",
+    256:  "★ покраска: zone = 4−int(cmask.R·4+0.5), albedo·=свотч[zone]  [_1930]",
     2048: "AO ограничен вершинным цветом.w (min)",
-    8192: "Glow-сила = Params2.x",
+    8192: "Glow-сила = Params2.x  [_1948]",
 }
 
 
@@ -434,7 +439,6 @@ def emulate_shader(flags, uniforms):
     P = uniforms.get("gMaterialParamsVec4") or []
     P2 = uniforms.get("gMaterialParams2Vec4") or []
     px, py, pz = _f(P, 0, 0.9), _f(P, 1, 0.5), _f(P, 2, 0.0)
-    has_masks = "_F25_MASKS_MAP" in fl
     out = {
         "dyn_x": dynx,
         "active_bits": [(b, d) for b, d in sorted(DYNBITS.items()) if dynx & b],
@@ -446,8 +450,9 @@ def emulate_shader(flags, uniforms):
         out["glow"] = "clamp(%s·Params2.x=%.2f, 0..4)" % (gmask, _f(P2, 0, 0.0))
     else:
         out["glow"] = "0 (выключено)"
-    # Subsurface — наша ключевая находка: masks.A НЕ AO, а подповерхностное свечение
-    out["subsurface"] = ("masks.A·Params.y=%.2f" % py) if has_masks else "нет masks-карты"
+    # Subsurface — наша ключевая находка: masks.A НЕ AO, а подповерхностное свечение.
+    # Гейт — ТОЧНЫЙ игровой бит 16 (не «есть _F25»): shader _1942 = (dyn&16?masks.A:1)·Params.y
+    out["subsurface"] = ("masks.A·Params.y=%.2f" % py) if (dynx & 16) else ("1·Params.y=%.2f (masks.A-ветка выкл)" % py)
     out["ao"] = "gOcclusionMap.G" + ("  (min с вершинным.w)" if (dynx & 2048) else "") if (dynx & 64) else "1.0 (нет AO-карты)"
     if dynx & 256:
         out["paint"] = "zone = 4−int(cmask.R·4+0.5); zone<4 → albedo·=свотч палитры[zone] (без своей cmask: R=126 → зона 2 целиком)"
