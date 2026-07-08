@@ -465,6 +465,69 @@ def part_id_for(oid, obj):
     return "_" + oid
 
 
+_ATTACH_RE = re.compile(
+    r'name="Name" value="ATTACHMENT" />\s*<Property name="Value" value="([^"]+\.ENTITY\.MBIN)"', re.I)
+
+
+def resolve_placement_entities(oids, objs, parts, pcbanks, manifest, mbin, raw):
+    """Авторитетно (BIGGS/Corvette, стены, двери): у детали нет записи в partstable, а
+    PlacementScene ведёт на *_PLACEMENT-стуб. Настоящий меш = placement-сцена → ATTACHMENT
+    *.ENTITY → GcBasePlacementComponentData.Rules.PartID → partstable[PartID].
+    Различитель: правила на РАЗНЫХ локаторах = «сборка» (комната) — единого меша нет, пропуск.
+    Возвращает ({oid:{part_id,scene}}, set(новые_сцены_для_загрузки))."""
+    cand = {oid: objs[oid]["PlacementScene"] for oid in oids
+            if not parts.get(part_id_for(oid, objs[oid]))
+            and objs[oid].get("PlacementScene") and "_placement" in norm(objs[oid]["PlacementScene"])}
+    if not cand:
+        return {}, set()
+    loc = extract_files(pcbanks, manifest, sorted(set(cand.values())), raw)
+    dec = decode_files(mbin, [v for v in loc.values() if v])
+    ent_of = {}
+    for oid, ps in cand.items():
+        lf = loc.get(norm(ps)); mxf = dec.get(lf) if lf else None
+        if not mxf:
+            continue
+        try:
+            m = _ATTACH_RE.search(open(mxf, encoding="utf-8", errors="replace").read())
+        except OSError:
+            continue
+        if m:
+            ent_of[oid] = m.group(1)
+    if not ent_of:
+        return {}, set()
+    loc2 = extract_files(pcbanks, manifest, sorted(set(ent_of.values())), raw)
+    dec2 = decode_files(mbin, [v for v in loc2.values() if v])
+    out, new_scenes = {}, set()
+    for oid, ent in ent_of.items():
+        lf = loc2.get(norm(ent)); mxf = dec2.get(lf) if lf else None
+        if not mxf:
+            continue
+        try:
+            etxt = open(mxf, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        if "GameTableConfig" in etxt:
+            continue                      # game-table — обрабатывается отдельно
+        rules = []
+        for block in re.split(r'value="GcBasePlacementRule"', etxt)[1:]:
+            pm = re.search(r'name="PartID" value="([^"]+)"', block)
+            if not pm:
+                continue
+            lm = re.search(r'name="PositionLocator" value="([^"]*)"', block)
+            states = re.findall(r'name="SnapState" value="(NotSnapped|IsSnapped)"', block)
+            rules.append((pm.group(1), lm.group(1) if lm else "",
+                          bool(states) and all(s == "NotSnapped" for s in states)))
+        if not rules or len({l for _p, l, _n in rules}) > 1:
+            continue
+        rpid = next((p for p, _l, ns in rules if ns), rules[0][0])
+        styles = parts.get(rpid)
+        if not styles:
+            continue
+        out[oid] = {"part_id": rpid, "scene": next(iter(styles.values()))}
+        new_scenes.add(out[oid]["scene"])
+    return out, new_scenes
+
+
 def main():
     ap = argparse.ArgumentParser(description="Индексатор связей деталей NMS из PCBANKS")
     ap.add_argument("pcbanks", help="папка GAMEDATA\\PCBANKS с .pak файлами")
@@ -513,9 +576,15 @@ def main():
     db = {"_source": {"pcbanks": os.path.abspath(args.pcbanks)},
           "parts": {}, "scenes": {}, "materials": {}}
 
+    entity_resolved = {}
     if not args.tables_only:
-        # 3: сцены (стили выбранной детали + placement) + рекурсия REFERENCE
-        want_scenes = set()
+        # 2b: авторитетная резолюция BIGGS/Corvette (и стен/дверей) через placement-entity → PartID
+        print("[2b] placement-entity → PartID для деталей без записи в partstable...")
+        entity_resolved, entity_scenes = resolve_placement_entities(
+            oids, objs, parts, args.pcbanks, manifest, args.mbin, raw)
+        print("    настоящий меш получили: %d деталей" % len(entity_resolved))
+        # 3: сцены (стили детали + placement + entity-резолюция) + рекурсия REFERENCE
+        want_scenes = set(entity_scenes)
         for oid in oids:
             o = objs[oid]
             pid = part_id_for(oid, o)
@@ -629,8 +698,13 @@ def main():
         styles = parts.get(pid, {})
         style = o["Style"] if o["Style"] not in ("", "None") else None
         scene = None
+        er = entity_resolved.get(oid)
         if styles:
             scene = styles.get(style) or next(iter(styles.values()))
+        elif er:                                  # авторитетно через placement-entity (BIGGS/Corvette)
+            pid = er["part_id"]
+            styles = parts.get(pid, {})
+            scene = er["scene"]
         elif o["PlacementScene"]:
             scene = o["PlacementScene"]
         mismatch = None
@@ -642,6 +716,7 @@ def main():
                 n_mismatch += 1
         rec = {"object": o, "part_id": pid, "styles": styles, "scene": scene,
                "placement_differs": mismatch,
+               "via_placement_entity": bool(er),
                "hulls": hulls.get(pid) or hulls.get(oid),
                "legacy": oid in legacy,
                "icon": icon_of.get(oid)}

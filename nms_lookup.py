@@ -698,6 +698,85 @@ def runtime_config_scene(scene_file):
     return scn.group(1), chain
 
 
+def icon_mesh_token(oid):
+    """Правило 18: имя меша зашито в имени иконки —
+    buildable/<style>/<mesh>.dds ЛИБО buildable/buildable.<mesh>.dds -> <mesh> (lower)."""
+    try:
+        with open(ICON_MAP, "r", encoding="utf-8-sig", errors="replace") as fh:
+            dds = json.load(fh).get(oid)
+    except Exception:
+        return None
+    if not dds:
+        return None
+    base = re.sub(r"\.dds$", "", dds.replace("\\", "/").split("/")[-1], flags=re.I)
+    if base.lower().startswith("buildable."):
+        base = base[len("buildable."):]
+    return base.lower() or None
+
+
+def placement_entity_scene(obj, style=None):
+    """Авторитетная резолюция настоящего меша, когда обычная цепочка даёт placement-стуб
+    (BIGGS/Corvette, а также стены/двери): objectstable.PlacementScene → ATTACHMENT *.ENTITY →
+    GcBasePlacementComponentData.Rules.PartID → partstable[PartID] → настоящая сцена.
+    Проверено 09.07: B_ALK_A → EXTHATCHAIRLOCKA1X1.ENTITY → _BIGGS_EXTHATCHALK1X1A →
+    MODELS/COMMON/SPACECRAFT/BIGGS/MODULES/PARTS/AIRLOCK_NESW_A.SCENE.
+    Различитель (как в сборщике nms_meshwork.placement_entity_partid): если правила сидят на
+    РАЗНЫХ локаторах — это «сборка» (напр. комната cuberoom), единого меша нет → (None, chain).
+    Возвращает (real_scene_gamepath|None, chain|None)."""
+    ps = obj.get("PlacementScene") if obj else None
+    if not ps:
+        return None, None
+    pf = find_decoded(ps, SCENE_DIRS + SCENE_DIRS_EXTRA, ".scene.MXML")
+    if not pf:
+        return None, None
+    try:
+        txt = open(pf[0], encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None, None
+    am = SCENE_ATTACH_RE.search(txt)
+    if not am:
+        return None, None
+    ent_game = am.group(1)
+    ent_mxml = _precache_mxml(ent_game)
+    if not ent_mxml:
+        hit = find_decoded(ent_game, [os.path.join(MB, "NEW_EXTRACT_2026"),
+                                      os.path.join(MB, "MESHWORK_EXTRACT_2026")], ".entity.MXML")
+        ent_mxml = hit[0] if hit else None
+    if not ent_mxml:
+        return None, {"kind": "PlacementEntity", "entity": ent_game, "error": "entity не расшифрован"}
+    etxt = open(ent_mxml, encoding="utf-8", errors="replace").read()
+    if "GameTableConfig" in etxt:
+        return None, None          # game-table — обрабатывает отдельный резолвер
+    rules = []
+    for block in re.split(r'value="GcBasePlacementRule"', etxt)[1:]:
+        pm = re.search(r'name="PartID" value="([^"]+)"', block)
+        if not pm:
+            continue
+        lm = re.search(r'name="PositionLocator" value="([^"]*)"', block)
+        states = re.findall(r'name="SnapState" value="(NotSnapped|IsSnapped)"', block)
+        rules.append((pm.group(1), lm.group(1) if lm else "",
+                      bool(states) and all(s == "NotSnapped" for s in states)))
+    if not rules:
+        return None, None
+    chain = {"kind": "PlacementEntity", "entity": ent_game,
+             "part_ids": sorted({p for p, _l, _n in rules})}
+    if len({loc for _p, loc, _n in rules}) > 1:
+        chain["error"] = "правила на разных локаторах — сборка (комната), единого меша нет"
+        return None, chain
+    pid = next((p for p, _l, ns in rules if ns), rules[0][0])
+    chain["part_id"] = pid
+    part = parse_partstable(pid)
+    if not part or not part.get("StyleModels"):
+        chain["error"] = "PartID %s не найден в partstable" % pid
+        return None, chain
+    sm = None
+    if style:
+        sm = next((s for s in part["StyleModels"] if s["Style"].lower() == style.lower()), None)
+    sm = sm or part["StyleModels"][0]
+    chain["scene"] = sm["Scene"]
+    return sm["Scene"], chain
+
+
 def lookup(oid, style=None, brief=False, use_placement=False):
     r = {"query": oid}
     obj = parse_objectstable(oid)
@@ -756,6 +835,28 @@ def lookup(oid, style=None, brief=False, use_placement=False):
                         r["scene"] = scene
                         r["scene_path"] = real
                         r["scene_via_runtime_config"] = True
+            # ★ фолбэк (урок 09.07, BIGGS/Corvette): обычная цепочка дала placement-стуб и это не
+            # game-table → авторитетно берём меш через placement-entity → PartID → partstable.
+            # Стуб = 0 MESH-узлов ЛИБО нет записи в partstable, а выбрана PlacementScene *_PLACEMENT
+            # (у неё бывает пусто ИЛИ единственный bounds-прокси MESHBOUNDS+lambert1, как COCKPIT_A_1X2).
+            _placement_stub = bool(part is None and scene_path
+                                   and re.search(r"_placement\.scene", scene_path, re.I))
+            if (not scene["meshes"] or _placement_stub) and not r.get("scene_via_runtime_config"):
+                real, chain = placement_entity_scene(obj, style)
+                if chain:
+                    r["placement_entity"] = chain
+                if real:
+                    rf = find_decoded(real, SCENE_DIRS + SCENE_DIRS_EXTRA, ".scene.MXML")
+                    if rf:
+                        scene = parse_scene(rf[0])
+                        r["scene"] = scene
+                        r["scene_path"] = real
+                        r["scene_via_placement_entity"] = True
+                    else:
+                        r["scene_real_not_extracted"] = real   # авторитетно, но не в дампах (тянуть из пака)
+                tok = icon_mesh_token(oid)                     # вторичная подсказка (Правило 18), не для сборки
+                if tok:
+                    r["icon_mesh_hint"] = tok
             if scene["GEOMETRY"]:
                 r["geometry"] = find_geometry(scene["GEOMETRY"])
             mats = sorted({m["MATERIAL"] for m in scene["meshes"]
@@ -837,8 +938,23 @@ def fmt_report(r):
                     rc.get("spawn", "?"), rc.get("scene") or rc.get("error", "?")))
         if r.get("scene_via_runtime_config"):
             L.append("  ★ настоящая сцена/меш взяты по этой цепочке (не пустышка)")
-    L.append("[СЦЕНА] %s%s" % (r.get("scene_path") or "—",
-                               "   (через рантайм-конфиг)" if r.get("scene_via_runtime_config") else ""))
+    pe = r.get("placement_entity")
+    if pe:
+        L.append("[PLACEMENT-ENTITY → PARTSTABLE] обычная цепочка дала placement-стуб:")
+        L.append("  entity: %s" % pe.get("entity", "?"))
+        if pe.get("part_id"):
+            L.append("  PartID (правило placement) = %s" % pe["part_id"])
+        if pe.get("scene"):
+            mark = ("★ взят вместо стуба" if r.get("scene_via_placement_entity")
+                    else "!! НЕ извлечён из пака — распаковать" if r.get("scene_real_not_extracted") else "")
+            L.append("  настоящий меш = %s   %s" % (pe["scene"], mark))
+        elif pe.get("error"):
+            L.append("  !! %s" % pe["error"])
+        if r.get("icon_mesh_hint"):
+            L.append("  (подсказка иконки/Правило 18: %s)" % r["icon_mesh_hint"])
+    _via = ("   (через рантайм-конфиг)" if r.get("scene_via_runtime_config")
+            else "   (через placement-entity)" if r.get("scene_via_placement_entity") else "")
+    L.append("[СЦЕНА] %s%s" % (r.get("scene_path") or "—", _via))
     sc = r.get("scene")
     if sc and "error" not in sc:
         L.append("  файл: %s" % sc["file"])
