@@ -522,6 +522,58 @@ def placement_entity_partid(placement_path, extr):
     return rules[0][0]
 
 
+# ------------------------------------------------------------------ РАНТАЙМ-КОНФИГ
+# Урок 08.07 (GAMETABLE): сцена детали БЕЗ MESH-узлов ≠ «модели нет» — модель бывает
+# загружена в РАНТАЙМЕ через entity-конфиг. Игровые столы: сцена → ATTACHMENT *.ENTITY →
+# GcGameTablePlacementComponentData.GameTableConfig → gametablesdatatable
+# (GameTableConfigs[cfg].SpawnDataId → GameTableSpawnData[spawn].SceneFilename).
+GAMETABLES_MBIN = "metadata/simulation/gametables/gametablesdatatable.mbin"
+
+
+def scene_has_no_mesh(scene_file):
+    """В декодированной сцене нет MESH-узлов (кандидат на рантайм-конфиг)."""
+    try:
+        return 'value="MESH"' not in open(scene_file, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return False
+
+
+def runtime_config_scene(scene_file, extr):
+    """Настоящая сцена детали, чья модель грузится через entity-конфиг (game-table).
+    Возвращает игровой путь (.scene.mbin, _norm) или None."""
+    if extr is None:
+        return None
+    try:
+        txt = open(scene_file, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    att = re.findall(r'name="Name" value="ATTACHMENT" />\s*\n\s*'
+                     r'<Property name="Value" value="([^"]+\.ENTITY\.MBIN)"', txt, re.I)
+    if not att:
+        return None
+    ent_key = _norm(att[0])
+    ent = extr.fetch_decode(ent_key, os.path.join(MW, _flat(ent_key.replace(".entity.mbin", "")) + ".entity.mbin"))
+    if not ent:
+        return None
+    cm = re.search(r'name="GameTableConfig" value="([^"]+)"',
+                   open(ent, encoding="utf-8", errors="replace").read())
+    if not cm:
+        return None                # другой тип рантайм-конфига — пока не поддержан
+    gt = extr.fetch_decode(GAMETABLES_MBIN, os.path.join(MW, "gametablesdatatable.mbin"))
+    if not gt:
+        return None
+    gtxt = open(gt, encoding="utf-8", errors="replace").read()
+    cfg = re.search(r'value="GcGameTableConfig" _id="%s">(.*?)</Property>'
+                    % re.escape(cm.group(1)), gtxt, re.S)
+    sp = re.search(r'name="SpawnDataId" value="([^"]+)"', cfg.group(1)) if cfg else None
+    if not sp:
+        return None
+    spd = re.search(r'value="GcGameTableSpawnData" _id="%s">(.*?)</Property>'
+                    % re.escape(sp.group(1)), gtxt, re.S)
+    scn = re.search(r'name="SceneFilename" value="([^"]+)"', spd.group(1)) if spd else None
+    return _norm(scn.group(1)) if scn else None
+
+
 # ------------------------------------------------------------------ ДЕСКРИПТОРЫ (варианты)
 # «Как игра строит такие цепочки» (запрос юзера 07.07, фоссилы): рядом со сценой лежит
 # *.DESCRIPTOR.MBIN — штатная система вариантов игры. body.descriptor: опции _BODY_A +
@@ -1205,6 +1257,15 @@ def main():
         l0 = len(LEGACY_USED)
         if scene_game:
             scene_file = ensure_tree(scene_game, extr, geodirs)
+        # ★ РАНТАЙМ-КОНФИГ (GAMETABLE): сцена без MESH → модель за entity-конфигом
+        # (game-table). Трассируем и подменяем на настоящую сцену — автоловля цепочки.
+        if scene_file and scene_has_no_mesh(scene_file):
+            real = runtime_config_scene(scene_file, extr)
+            if real:
+                rf = ensure_tree(real, extr, geodirs)
+                if rf and not scene_has_no_mesh(rf):
+                    scene_game, scene_file = real, rf
+                    rec["flags"].append("рантайм-конфиг игры (game-table) → " + real.split("/")[-1])
         if extr and extr.n_extracted > n0:
             rec["flags"].append("извлечено из игры: %d файлов" % (extr.n_extracted - n0))
         if len(LEGACY_USED) > l0:

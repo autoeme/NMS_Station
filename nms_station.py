@@ -15,6 +15,7 @@ exe сам служит и окном, и дочерними задачами.
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -538,7 +539,10 @@ class Station(tk.Tk):
             self.log(self.t("fail_start") % e + "\n")
             self.proc = None
             return
+        self._task_title = title
+        self._prog_det = False            # полоса ещё в режиме крутилки
         self.status.set(self.t("busy") % title)
+        self.prog.configure(mode="indeterminate")
         self.prog.start(80)
         self.btn_index.configure(state="disabled")
         self.btn_lookup.configure(state="disabled")
@@ -575,9 +579,30 @@ class Station(tk.Tk):
                         self.load_gallery()        # и сразу показать все иконки
                 else:
                     self.log(item)
+                    self._update_progress(item)   # видимая загрузка внизу
         except queue.Empty:
             pass
         self.after(100, self.pump)
+
+    _PROG_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+    def _update_progress(self, line):
+        """Показывает прогресс подпроцесса внизу: строку X/Y из вывода -> статус + полоса %."""
+        m = None
+        for m in self._PROG_RE.finditer(line):
+            pass                       # берём ПОСЛЕДНЕЕ X/Y в строке (это счётчик)
+        if not m:
+            return
+        cur, tot = int(m.group(1)), int(m.group(2))
+        if tot <= 0 or cur > tot:
+            return
+        if not self._prog_det:         # переключить крутилку на полосу-процент
+            self.prog.stop()
+            self.prog.configure(mode="determinate", maximum=100)
+            self._prog_det = True
+        pct = int(cur * 100 / tot)
+        self.prog["value"] = pct
+        self.status.set("%s  —  %d/%d  (%d%%)" % (self._task_title, cur, tot, pct))
 
     # ------------------------------------------------------------ иконка
     def icon_dirs(self):
