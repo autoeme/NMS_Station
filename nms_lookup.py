@@ -241,6 +241,7 @@ def parse_objectstable(oid):
         "ShowInBuildMenu": prop_val(entry, "ShowInBuildMenu"),
         "Groups": ["%s / %s" % g for g in groups],
         "ColourPaletteGroupId": prop_val(entry, "ColourPaletteGroupId"),
+        "DefaultColourPaletteId": prop_val(entry, "DefaultColourPaletteId"),
         "MaterialGroupId": prop_val(entry, "MaterialGroupId"),
         "CanChangeColour": prop_val(entry, "CanChangeColour"),
         "CanChangeMaterial": prop_val(entry, "CanChangeMaterial"),
@@ -254,6 +255,37 @@ def parse_objectstable(oid):
         "FamilyIDs": families,
         "HasLinkGridData": 'name="LinkGridData"' in entry,
     }
+
+
+_PALETTES = None
+
+def parse_palettes():
+    """Строительная палитра игры (GcBaseBuildingPalette в шапке objectstable):
+    PaletteId -> {P,S,T,Q} = Primary/Secondary/Ternary/Quaternary Colour (ЛИНЕЙНЫЕ 0-1).
+    Порядок P/S/T/Q = зоны 0/1/2/3 покраски (сверено с игрой 10.07). Кэш."""
+    global _PALETTES
+    if _PALETTES is not None:
+        return _PALETTES
+    _PALETTES = {}
+    try:
+        txt = open(OBJECTSTABLE, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return _PALETTES
+
+    def col(block, field):
+        m = re.search(r'name="%s">\s*<Property name="R" value="([\d.]+)"\s*/>\s*'
+                      r'<Property name="G" value="([\d.]+)"\s*/>\s*'
+                      r'<Property name="B" value="([\d.]+)"' % field, block)
+        return [round(float(m.group(i)), 4) for i in (1, 2, 3)] if m else None
+
+    for chunk in txt.split('value="GcBaseBuildingPalette" _id="')[1:]:
+        pid = chunk[:chunk.find('"')]
+        block = chunk[:2000]                      # 4 цвета лежат в начале записи
+        _PALETTES[pid] = {"P": col(block, "PrimaryColour"),
+                          "S": col(block, "SecondaryColour"),
+                          "T": col(block, "TernaryColour"),
+                          "Q": col(block, "QuaternaryColour")}
+    return _PALETTES
 
 
 def parse_partstable(pid):
@@ -880,6 +912,15 @@ def lookup(oid, style=None, brief=False, use_placement=False):
 
     r["icon"] = icon_info(oid)
     r["project"] = project_state(oid)
+
+    # цвета зон покраски: дефолт-свотч детали -> GcBaseBuildingPalette (P/S/T/Q = зоны 0..3)
+    if obj:
+        dpid = (obj.get("DefaultColourPaletteId") or "").strip()
+        pals = parse_palettes()
+        if dpid and dpid in pals:
+            r["zone_colours"] = dict(pals[dpid], id=dpid)
+        elif obj.get("ColourPaletteGroupId"):
+            r["zone_colours"] = {"group": obj["ColourPaletteGroupId"], "no_default": True}
     return r
 
 
@@ -899,6 +940,17 @@ def fmt_report(r):
         L.append("  Палитры: colour=%s material=%s  CanChangeColour=%s CanChangeMaterial=%s"
                  % (obj["ColourPaletteGroupId"], obj["MaterialGroupId"],
                     obj["CanChangeColour"], obj["CanChangeMaterial"]))
+        zc = r.get("zone_colours")
+        if zc and not zc.get("no_default"):
+            fc = lambda c: ("%.3f %.3f %.3f" % tuple(c)) if c else "—"
+            L.append("  ЦВЕТА ЗОН ПОКРАСКИ (свотч %s, ЛИНЕЙНЫЕ 0-1; albedo = diffuse × цвет[zone]):" % zc["id"])
+            L.append("    зона0 = Primary    %s" % fc(zc.get("P")))
+            L.append("    зона1 = Secondary  %s" % fc(zc.get("S")))
+            L.append("    зона2 = Ternary    %s" % fc(zc.get("T")))
+            L.append("    зона3 = Quaternary %s" % fc(zc.get("Q")))
+            L.append("    зона4 = не красится (чистый диффуз).  cmask.R: 1→з0, .75→з1, .5→з2, .25→з3, 0→з4")
+        elif zc:
+            L.append("  ЦВЕТА ЗОН: дефолт-свотча нет (группа %s) — по умолчанию зоны = чистый диффуз, пока игрок не покрасит" % zc.get("group"))
         L.append("  CanScale=%s CanRotate3D=%s SnapRotateBlocked=%s"
                  % (obj["CanScale"], obj["CanRotate3D"], obj["SnapRotateBlocked"]))
         bb = obj["Buildable"]
