@@ -335,7 +335,9 @@ class Station(tk.Tk):
         self._reg(ttk.Checkbutton(row, variable=self.var_tables), "tables_only").pack(side="left")
         self._reg(ttk.Label(row), "limit").pack(side="left")
         self.var_limit = tk.StringVar(value="")
-        ttk.Entry(row, textvariable=self.var_limit, width=6).pack(side="left")
+        e_lim = ttk.Entry(row, textvariable=self.var_limit, width=6)
+        e_lim.pack(side="left")
+        self._bind_clipboard(e_lim)
 
         ttk.Separator(row, orient="vertical").pack(side="left", fill="y", padx=10)
         self._reg(ttk.Label(row), "oid").pack(side="left")
@@ -343,9 +345,14 @@ class Station(tk.Tk):
         e = ttk.Entry(row, textvariable=self.var_oid, width=18)
         e.pack(side="left", padx=(2, 4))
         e.bind("<Return>", lambda _ev: self.run_lookup())
+        e.bind("<KP_Enter>", lambda _ev: self.run_lookup())   # Enter на цифровой клаве
+        self.e_oid = e
+        self._bind_clipboard(e)                                # вставка ObjectID при любой раскладке
         self._reg(ttk.Label(row), "style").pack(side="left")
         self.var_style = tk.StringVar(value="")
-        ttk.Entry(row, textvariable=self.var_style, width=10).pack(side="left", padx=(2, 4))
+        e_sty = ttk.Entry(row, textvariable=self.var_style, width=10)
+        e_sty.pack(side="left", padx=(2, 4))
+        self._bind_clipboard(e_sty)
         self.btn_lookup = self._reg(ttk.Button(row, command=self.run_lookup), "passport")
         self.btn_lookup.pack(side="left", padx=(0, 4))
         self.btn_lookup_all = self._reg(ttk.Button(row, command=self.run_lookup_all), "passport_all")
@@ -482,7 +489,9 @@ class Station(tk.Tk):
     # ------------------------------------------------------------ UI helpers
     def _path_row(self, parent, r, key, var, is_dir):
         self._reg(ttk.Label(parent), key).grid(row=r, column=0, sticky="w")
-        ttk.Entry(parent, textvariable=var).grid(row=r, column=1, sticky="ew", padx=4)
+        _ent = ttk.Entry(parent, textvariable=var)
+        _ent.grid(row=r, column=1, sticky="ew", padx=4)
+        self._bind_clipboard(_ent)
 
         def browse():
             if is_dir:
@@ -497,6 +506,44 @@ class Station(tk.Tk):
     def log(self, s):
         self.text.insert("end", s)
         self.text.see("end")
+
+    def _bind_clipboard(self, w):
+        """Ctrl+C/V/X/A и правый клик работают при ЛЮБОЙ раскладке клавиатуры.
+        Tk по умолчанию вешает cut/copy/paste на ЛАТИНСКИЙ keysym — при русской
+        раскладке физическая V даёт кириллический keysym, и Ctrl+V не срабатывает
+        (нельзя вставить ObjectID из буфера). Ловим по keycode (VK-код, от раскладки
+        не зависит) и шлём виртуальные события; плюс контекстное меню по правому клику."""
+        def on_ctrl(ev):
+            kc = getattr(ev, "keycode", 0)
+            if kc == 65:                         # A — выделить всё
+                try:
+                    w.select_range(0, "end"); w.icursor("end")
+                except Exception:
+                    pass
+                return "break"
+            ve = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>"}.get(kc)
+            if ve:
+                w.event_generate(ve)
+                return "break"
+        w.bind("<Control-KeyPress>", on_ctrl, add="+")
+        ru = getattr(self, "lang", "ru") == "ru"
+        lab = ((("Вырезать", "Копировать", "Вставить", "Выделить всё")) if ru
+               else ("Cut", "Copy", "Paste", "Select all"))
+        m = tk.Menu(w, tearoff=0)
+        m.add_command(label=lab[0], command=lambda: w.event_generate("<<Cut>>"))
+        m.add_command(label=lab[1], command=lambda: w.event_generate("<<Copy>>"))
+        m.add_command(label=lab[2], command=lambda: w.event_generate("<<Paste>>"))
+        m.add_separator()
+        m.add_command(label=lab[3],
+                      command=lambda: (w.select_range(0, "end"), w.icursor("end")))
+
+        def popup(ev):
+            w.focus_set()
+            try:
+                m.tk_popup(ev.x_root, ev.y_root)
+            finally:
+                m.grab_release()
+        w.bind("<Button-3>", popup, add="+")
 
     def save_settings(self):
         try:
@@ -773,6 +820,13 @@ class Station(tk.Tk):
         self._start(self._child_argv("indexer", args), self.t("task_index") % pc)
 
     def run_lookup(self):
+        try:
+            self._run_lookup_impl()
+        except Exception as e:
+            import traceback
+            self.log("\n!! run_lookup: %s\n%s\n" % (e, traceback.format_exc()))
+
+    def _run_lookup_impl(self):
         oid = self.var_oid.get().strip()
         if not oid:
             self.log("\n" + self.t("enter_oid") + "\n")
