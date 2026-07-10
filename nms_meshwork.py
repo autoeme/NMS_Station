@@ -67,7 +67,7 @@ ICONS_DIRS = [os.path.join(DEF_INDEX, "icons"),
 BUILD_TIMEOUT = 600      # сек на одну деталь (виснущие стопки вариантов)
 GIANT_MB = 40            # OBJ больше — «гигант», превью пропускаем (Правило 2/13)
 # известные виснущие меши (корвет-стопки вариантов, quadratic weld) — скип с пометкой
-PATHOLOGICAL = {"landinggear_leg_c", "module_generators", "module_pumps", "vehiclegaragemech"}
+PATHOLOGICAL = {"landinggear_leg_c", "module_generators", "module_pumps"}  # vehiclegaragemech снят 11.07: conv2026 собирает за 1с
 
 # собраны ВРУЧНУЮ по решению юзера — автоматом НЕ пересобирать (пересборка по сцене
 # даст «правильный», но НЕ ЖЕЛАЕМЫЙ меш; см. memory/group-by-group-mesh-qc, коммит 857b848c)
