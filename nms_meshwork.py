@@ -84,11 +84,16 @@ SUBPART_SCENE = {"CORRIDOR_WINDOW": "corridor_windowframe",
 
 LODRE = re.compile(r"lod(\d)", re.I)
 SKIPNAME = re.compile(r"shadow|collision|waterproxy|_proxy|wallbb", re.I)
-SKIPREF = re.compile(r"snap|shadow|collision|_proxy|refwall\b", re.I)
+# 12.07 (Corvette B_COK_*): эффекты ПОЛЁТА в сценах кабин — варп-туннели
+# (EFFECTS\WARP\REENTRY/SPEEDTUNNEL, «оранжевые ковры» 27+ м) и HUD-проекции
+# (MODELS\HUD\COCKPITHUD_*) — при постановке в строителе игры НЕ рендерятся.
+# Паттерн кроет оба разделителя путей: models\effects\warp и models__effects__warp.
+_FLIGHT_FX = r"effects[\\_/]+warp|models[\\_/]+hud"
+SKIPREF = re.compile(r"snap|shadow|collision|_proxy|refwall\b|" + _FLIGHT_FX, re.I)
 # «мягкий» фильтр для комнат spacebase: их содержимое = SnapGroup_*-REFERENCE'ы
 # (cuberoom_a: стены/углы/пол/люки — ВСЕ через SnapGroup; прецедент — relaxed
 # snap-REF добор в легаси-текстурном пассе). Применяется ТОЛЬКО как повтор при ПУСТО.
-SKIPREF_RELAX = re.compile(r"shadow|collision|_proxy|refwall\b", re.I)
+SKIPREF_RELAX = re.compile(r"shadow|collision|_proxy|refwall\b|" + _FLIGHT_FX, re.I)
 
 
 # ------------------------------------------------------------------ разрешение сцены
@@ -278,10 +283,13 @@ def scene_lod0(scene_file, depth=0, seen=None, relax=False, extra=""):
     skip_re = SKIPREF_RELAX if relax else SKIPREF
     extra_rx = re.compile(extra, re.I) if extra else None
     if seen is None:
-        seen = set()
+        seen = frozenset()
+    # seen = ТОЛЬКО предки по текущему пути (защита от цикла): повторные REFERENCE
+    # одной под-сцены (крыло корвета: EXTERIORLIGHT ×6; коридор ExSec1/ExSec2) — это
+    # РАЗНЫЕ инстансы, каждый считается (урок LS/Corvette 12.07: чинить счётчик, не меш)
     if scene_file in seen or depth > 6:
         return 0, []
-    seen.add(scene_file)
+    seen = frozenset(seen) | {scene_file}
     try:
         root = ET.parse(scene_file).getroot()
     except ET.ParseError:
@@ -311,7 +319,10 @@ def scene_lod0(scene_file, depth=0, seen=None, relax=False, extra=""):
         m = LODRE.search(name.lower())
         lod = int(m.group(1)) if m else lod_ctx
         aa = attrs_of(node)
-        if typ == "MESH" and not SKIPNAME.search(name.lower()) and (lod is None or lod == 0):
+        # LODLEVEL = АВТОРИТЕТ (имена врут: fossils SF_01LOD4LOD0), см. conv2026
+        lvl = aa.get("LODLEVEL")
+        mesh_lod0 = (lvl == "0") if lvl not in (None, "") else (lod is None or lod == 0)
+        if typ == "MESH" and not SKIPNAME.search(name.lower()) and mesh_lod0:
             tris += int(aa.get("BATCHCOUNT", 0) or 0) // 3
             mat = os.path.basename(aa.get("MATERIAL", "")).split(".")[0].lower()
             if mat and mat not in mats:
@@ -498,28 +509,215 @@ def placement_entity_partid(placement_path, extr):
         mx = extr.fetch_decode(ent_key, os.path.join(MW, _flat(ent_key.replace(".entity.mbin", "")) + ".entity.mbin"))
     if not mx:
         return None
-    etxt = open(mx, encoding="utf-8", errors="replace").read()
-    rules = []
-    for block in re.split(r'value="GcBasePlacementRule"', etxt)[1:]:
-        pm = re.search(r'<Property name="PartID" value="([^"]+)"', block)
-        if not pm:
-            continue
-        lm = re.search(r'<Property name="PositionLocator" value="([^"]*)"', block)
-        states = re.findall(r'<Property name="SnapState" value="(NotSnapped|IsSnapped)"', block)
-        rules.append((pm.group(1), lm.group(1) if lm else "",
-                      bool(states) and all(s == "NotSnapped" for s in states)))
+    rules = _parse_entity_rules(mx)  # честная оценка условий (см. _parse_entity_rules)
     if not rules:
         return None
-    # РАЗЛИЧИТЕЛЬ (проверен по данным 06.07): у «подмен» (стена _WALLB/M/T, дверь
-    # _DOORB0/_DOORWINB0, корвет-модуль) ВСЕ правила на ОДНОМ локаторе — деталь
-    # показывает один PartID за раз; у «сборки» (комната cuberoom: пол + стороны +
-    # углы) локаторы РАЗНЫЕ — единого визуала нет, entity-цепочка НЕ применима.
-    if len({loc for _pid, loc, _ns in rules}) > 1:
+    # РАЗЛИЧИТЕЛЬ (проверен по данным 06.07, уточнён 12.07 на Corvette): у «подмен»
+    # (стена _WALLB/M/T, дверь _DOORB0/_DOORWINB0, корвет-модуль) все правила дают
+    # ОДИН PartID — даже если локаторы разные (декор/турель корвета: правила на
+    # EXT_North/East/South/West/Top/Bottom, но PartID везде _BIGGS_EXTDECORATION);
+    # у «сборки» (комната cuberoom: пол + стороны + углы) PartID РАЗНЫЕ на разных
+    # локаторах — единого визуала нет, entity-цепочка НЕ применима.
+    if len({loc for _pid, loc, _ns in rules}) > 1 and len({pid for pid, _loc, _ns in rules}) > 1:
+        # КОНТЕКСТНАЯ деталь (B_DOOR0: дверной проём меняет PartID по стилю модуля,
+        # 16 правил IsSnapped + РОВНО ОДНО NotSnapped) — дефолт одиночной постановки
+        # = единственное NotSnapped-правило. Несколько NotSnapped на разных локаторах
+        # с разными PartID (B_LAN_B: 6 из 20) = настоящая сборка, цепочка не применима.
+        ns_rules = [r for r in rules if r[2]]
+        if len(ns_rules) == 1:
+            return ns_rules[0][0]
         return None
     for pid, _loc, ns in rules:
         if ns:
             return pid  # дефолтное состояние одиночной детали (NotSnapped)
     return rules[0][0]
+
+
+def _placement_rules(placement_path, extr):
+    """(entity-правила [(pid, locator, notsnapped)], текст placement-сцены) или (None, None)."""
+    sf = ensure_exact_scene(placement_path, extr)
+    if not sf:
+        return None, None
+    try:
+        txt = open(sf, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None, None
+    att = re.findall(r'name="Name" value="ATTACHMENT" />\s*\n\s*'
+                     r'<Property name="Value" value="([^"]+\.ENTITY\.MBIN)"', txt, re.I)
+    if not att:
+        return None, txt
+    mx = extr.fetch_decode(_norm(att[0]), os.path.join(
+        MW, _flat(_norm(att[0]).replace(".entity.mbin", "")) + ".entity.mbin")) if extr else None
+    if not mx:
+        return None, txt
+    rules = _parse_entity_rules(mx)
+    return rules, txt
+
+
+def _parse_entity_rules(entity_mxml):
+    """Правила GcBasePlacementComponentData с ЧЕСТНОЙ оценкой условий в «одиночном
+    мире» (все снап-точки NotSnapped). Плоский сбор SnapState давал «раздвоенные»
+    комнаты (hab_1x1: на WALLE1_ дверь И глухая стена — у двери условие IsSnapped
+    на сокете RoomW_Out (сосед пристыкован), у стены группа с ORConditions=true,
+    выполняющаяся при одиночной постановке). Возвращает [(pid, locator, ns)]."""
+    try:
+        root = ET.parse(entity_mxml).getroot()
+    except ET.ParseError:
+        return []
+
+    def val(el, name):
+        for c in el.findall("Property"):
+            if c.get("name") == name:
+                return c
+        return None
+
+    def eval_cond(cond_el):
+        """cond_el = <Property value="Gc*Condition"> — истинность при одиночной постановке."""
+        kind = cond_el.get("value") or ""
+        inner = cond_el.find("Property")  # <Property name="Gc*Condition"> обёртка
+        if inner is None:
+            return True
+        if kind == "GcGroupCondition":
+            conds_el = val(inner, "Conditions")
+            subs = list(conds_el.findall("Property")) if conds_el is not None else []
+            orf = val(inner, "ORConditions")
+            is_or = orf is not None and orf.get("value") == "true"
+            if not subs:
+                return True
+            vals = [eval_cond(s) for s in subs]
+            return any(vals) if is_or else all(vals)
+        # GcSnapPointCondition / GcOutSnapSocketCondition: «точка в состоянии X»;
+        # в одиночном мире всё NotSnapped -> условие истинно ⇔ X == NotSnapped
+        ss = inner.find('.//Property[@name="SnapState"]/Property[@name="SnapState"]')
+        if ss is None:
+            for c in inner.iter("Property"):
+                if c.get("name") == "SnapState" and c.get("value") in ("NotSnapped", "IsSnapped"):
+                    ss = c
+                    break
+        state = ss.get("value") if ss is not None else "NotSnapped"
+        return state == "NotSnapped"
+
+    rules = []
+    for rule in root.iter("Property"):
+        if rule.get("value") != "GcBasePlacementRule":
+            continue
+        pid_el = val(rule, "PartID")
+        if pid_el is None or not pid_el.get("value"):
+            continue
+        loc_el = val(rule, "PositionLocator")
+        conds_el = val(rule, "Conditions")
+        subs = list(conds_el.findall("Property")) if conds_el is not None else []
+        orf = val(rule, "ORConditions")
+        is_or = orf is not None and orf.get("value") == "true"
+        if not subs:
+            ns = True  # безусловное правило (ядро B_ALK_C)
+        else:
+            vals = [eval_cond(s) for s in subs]
+            ns = any(vals) if is_or else all(vals)
+        rules.append((pid_el.get("value"), loc_el.get("value") if loc_el is not None else "", ns))
+    return rules
+
+
+_ASM_REF = """\t\t<Property value="TkSceneNodeData">
+\t\t\t<Property name="Name" value="%s" />
+\t\t\t<Property name="Type" value="REFERENCE" />
+\t\t\t<Property name="Transform" value="TkTransformData">
+%s\t\t\t</Property>
+\t\t\t<Property name="Attributes">
+\t\t\t\t<Property value="TkSceneNodeAttributeData">
+\t\t\t\t\t<Property name="Name" value="SCENEGRAPH" />
+\t\t\t\t\t<Property name="Value" value="%s" />
+\t\t\t\t</Property>
+\t\t\t</Property>
+\t\t\t<Property name="Children" />
+\t\t</Property>
+"""
+
+
+def entity_assembly_scene(oid, placement_path, obj_style, extr, index_dir, geodirs, out_file):
+    """СБОРКА комнаты корвета по правилам placement-entity (B_HAB_A/B/C, B_LAN_B —
+    принцип юзера «меш детали = как она встаёт при постановке»): NotSnapped-правила
+    (локатор→PartID) + сцена RefPositionLocators (позиции локаторов) → синтетическая
+    сцена с REFERENCE-узлами на partstable-сцены частей. None, если это не сборка."""
+    rules, txt = _placement_rules(placement_path, extr)
+    if not rules or not txt:
+        return None
+    ns_rules = [(loc, pid) for pid, loc, ns in rules if ns]
+    if len({pid for _l, pid in ns_rules}) < 2:
+        return None  # подмена, не сборка — обычная цепочка
+    # локаторы: сцена *_POSITIONLOCATORS из REFERENCE placement-сцены (+ сама сцена)
+    locs = {}
+    def collect_locators(scene_txt):
+        for m in re.finditer(
+                r'<Property name="Name" value="([^"]+)" />\s*\n\s*<Property name="NameHash"[^>]*/>\s*\n\s*'
+                r'<Property name="Type" value="LOCATOR" />\s*\n\s*<Property name="Transform" value="TkTransformData">'
+                r'(.*?)</Property>', scene_txt, re.S):
+            vals = dict(re.findall(r'<Property name="(\w+)" value="([-\d.eE]+)"', m.group(2)))
+            locs[m.group(1)] = vals
+    # ⚠ 13.07: в MXML атрибут = <Property name="Name" value="SCENEGRAPH"/> — старый
+    # паттерн name="SCENEGRAPH" НЕ матчился никогда → локаторы не собирались и ВСЕ
+    # стены комнат падали в (0,0,0) («стена посередине комнаты», глаз юзера)
+    sgs = re.findall(r'(?:name|value)="SCENEGRAPH" */>\s*\n\s*<Property name="Value" value="([^"]+POSITIONLOCATORS[^"]*)"',
+                     txt, re.I)
+    if not sgs and ("HAB_" in placement_path.upper() or "EXTHATCH_" in placement_path.upper()):
+        # placement HAB-семьи без REF на локаторы: в игре ровно ДВЕ сцены позиций
+        # (hab_1x1 6x6 / hab_1x2 6x12) — берём по размеру модуля из имени placement.
+        # ⚠ ТОЛЬКО для hab-модулей: LANDINGBAY_B_1X2 = 10x20 м, hab-позиции ему ЧУЖИЕ
+        # (13.07 глаз юзера: стены/полы ангара вставали не по месту) — у ангара
+        # позиций в данных игры НЕТ вообще, его части честно не ставятся
+        size = "1x2" if "1X2" in placement_path.upper() else "1x1"
+        sgs = ["MODELS/COMMON/SPACECRAFT/BIGGS/MODULES/HAB_1X2_POSITIONLOCATORS.SCENE.MBIN" if size == "1x2"
+               else "MODELS/COMMON/SPACECRAFT/BIGGS/MODULES/PARTS/HAB_1X1_POSITIONLOCATORS.SCENE.MBIN"]
+    for sg in sgs:
+        lf = ensure_exact_scene(_norm(sg), extr)
+        if lf:
+            collect_locators(open(lf, encoding="utf-8", errors="replace").read())
+    collect_locators(txt)
+    pst = load_partstable(index_dir)
+    refs, missing = [], []
+    for i, (loc, pid) in enumerate(ns_rules):
+        row = pst.get(pid) or {}
+        part_scene = row.get(obj_style) or row.get("None") or (next(iter(row.values())) if row else None)
+        if not part_scene:
+            # части комнат корвета без записи в partstable лежат сценой напрямую:
+            # _BIGGS_WALL_B0 -> biggs/modules/parts/wall_b0.scene.mbin (проверено 12.07)
+            cand = "models/common/spacecraft/biggs/modules/parts/%s.scene.mbin" % pid.replace("_BIGGS_", "").lower()
+            if extr is not None and extr.man and cand in extr.man:
+                part_scene = cand
+        if not part_scene:
+            missing.append(pid)
+            continue
+        # ⚠ 13.07: локатор правила не найден НИ в одной сцене (LAN_B FLOOR2_/3_,
+        # CEILING2_/3_ — в данных игры их просто нет) — часть НЕ ставим (иначе она
+        # падала в (0,0,0) = мусор в центре), честно флагуем
+        if loc and loc not in locs:
+            missing.append(pid + "@" + loc + "(лок.нет)")
+            continue
+        ensure_tree(part_scene, extr, geodirs)
+        tv = locs.get(loc, {}) if loc else {}
+        tr = ""
+        for k, dflt in (("TransX", "0"), ("TransY", "0"), ("TransZ", "0"),
+                        ("RotX", "0"), ("RotY", "0"), ("RotZ", "0"),
+                        ("ScaleX", "1"), ("ScaleY", "1"), ("ScaleZ", "1")):
+            tr += '\t\t\t\t<Property name="%s" value="%s" />\n' % (k, tv.get(k, dflt))
+        refs.append(_ASM_REF % ("RefRoom%d_%s" % (i, (loc or "core").strip("_")), tr,
+                                part_scene.replace("/", "\\").upper()))
+    if not refs:
+        return None
+    xml = ('<?xml version="1.0" encoding="utf-8"?>\n<Data template="TkSceneNodeData">\n'
+           '\t<Property name="Name" value="ASSEMBLY_%s" />\n'
+           '\t<Property name="Type" value="MODEL" />\n'
+           '\t<Property name="Transform" value="TkTransformData">\n'
+           '\t\t<Property name="TransX" value="0" />\n\t\t<Property name="TransY" value="0" />\n'
+           '\t\t<Property name="TransZ" value="0" />\n\t\t<Property name="RotX" value="0" />\n'
+           '\t\t<Property name="RotY" value="0" />\n\t\t<Property name="RotZ" value="0" />\n'
+           '\t\t<Property name="ScaleX" value="1" />\n\t\t<Property name="ScaleY" value="1" />\n'
+           '\t\t<Property name="ScaleZ" value="1" />\n\t</Property>\n'
+           '\t<Property name="Attributes" />\n\t<Property name="Children">\n%s\t</Property>\n</Data>\n'
+           ) % (oid, "".join(refs))
+    with open(out_file, "w", encoding="utf-8") as fh:
+        fh.write(xml)
+    return out_file, len(refs), missing
 
 
 # ------------------------------------------------------------------ РАНТАЙМ-КОНФИГ
@@ -531,11 +729,18 @@ GAMETABLES_MBIN = "metadata/simulation/gametables/gametablesdatatable.mbin"
 
 
 def scene_has_no_mesh(scene_file):
-    """В декодированной сцене нет MESH-узлов (кандидат на рантайм-конфиг)."""
+    """В декодированной сцене нет НАСТОЯЩИХ MESH-узлов (кандидат на рантайм-конфиг/сборку).
+    Placement-стабы корвета несут единственный бокс MESHBOUNDS (12 треуг., lambert1) —
+    это НЕ модель (ловушка B_ALK_C 12.07: 'зелёный 1:1' совпал с такой же заглушкой)."""
     try:
-        return 'value="MESH"' not in open(scene_file, encoding="utf-8", errors="replace").read()
+        txt = open(scene_file, encoding="utf-8", errors="replace").read()
     except OSError:
         return False
+    if 'value="MESH"' not in txt:
+        return True
+    names = re.findall(r'<Property name="Name" value="([^"]*)" />\s*\n\s*'
+                       r'<Property name="NameHash"[^>]*/>\s*\n\s*<Property name="Type" value="MESH"', txt)
+    return bool(names) and all(n.split("|")[-1].upper().startswith("MESHBOUNDS") for n in names)
 
 
 def runtime_config_scene(scene_file, extr):
@@ -719,6 +924,149 @@ def descriptor_variant(oid, links, extr, geodirs):
     return sub, regex, "вариант по дескриптору игры: %s (%s)" % (os.path.basename(dmx), "; ".join(note_sel))
 
 
+# ------------------------------------------------------------------ ТАБЛИЦЫ КАСТОМИЗАЦИИ (фоссилы, 1:1)
+# 13.07.2026 (Fossils): буквы каталога — НЕ позиционная мапа на группы дескриптора.
+# Игра держит ЯВНЫЙ белый список узлов на каждый вариант в ДВУХ таблицах:
+#   modularcustomisationdatatable (ItemID -> ActivatedDescriptorGroupID, Exhibit -> сцена)
+#   charactercustomisationdescriptorgroupsdata (GroupID -> [_Body_A, _NECK_B, ...])
+# Пример подвоха: BI_BODY_BN = _Pelvis_A+_Body_A+_BodyAacc_Null+_NECK_B+_NECKBacc_Null —
+# первая буква оказалась ШЕЕЙ (длинная/короткая), буквенная формула давала пустой меш.
+# Дамп: meshwork\fossil_customisation_dump.py -> NMS_INDEX\fossil_variants.json.
+
+_FV_CACHE = None
+
+def _load_fossil_variants(index_dir):
+    global _FV_CACHE
+    if _FV_CACHE is None:
+        try:
+            with open(os.path.join(index_dir, "fossil_variants.json"), encoding="utf-8") as f:
+                _FV_CACHE = json.load(f)
+        except Exception:
+            _FV_CACHE = {}
+    return _FV_CACHE
+
+
+_FOLDER_IDS_CACHE = {}
+
+def _folder_option_ids(bdir, extr):
+    """{ключ_дескриптора: set(сырые Id опций)} по ВСЕМ *.descriptor.mbin папки."""
+    if bdir in _FOLDER_IDS_CACHE:
+        return _FOLDER_IDS_CACHE[bdir]
+    out = {}
+    if extr is not None:
+        depth = bdir.count("/") + 1
+        for k in extr.man:
+            if k.startswith(bdir + "/") and k.endswith(".descriptor.mbin") and k.count("/") == depth:
+                mx = extr.fetch_decode(k, os.path.join(MW, _flat(k.replace(".descriptor.mbin", "")) + ".descriptor.mbin"))
+                if not mx:
+                    continue
+                t = open(mx, encoding="utf-8", errors="replace").read()
+                out[k] = set(re.findall(r'name="Id" value="([^"]+)"', t))
+    _FOLDER_IDS_CACHE[bdir] = out
+    return out
+
+
+def _wl_keep(id_upper, wl_upper):
+    """Опция остаётся: точное имя из белого списка ЛИБО его LOD-меш (_NECKAACC_ALOD0
+    при белом _NECKAACC_A — HG кладёт меши LOD как отдельные Id)."""
+    if id_upper in wl_upper:
+        return True
+    return any(id_upper.startswith(w) and re.fullmatch(r"LOD\d", id_upper[len(w):])
+               for w in wl_upper)
+
+
+def customisation_variant(oid, extr, geodirs, index_dir):
+    """Вариант фоссила по таблицам кастомизации игры (1:1, без буквенных догадок).
+    Возвращает (сцена, exclude-regex, заметка) или None."""
+    fv = _load_fossil_variants(index_dir)
+    rec = (fv.get("items") or {}).get(oid)
+    if not rec or extr is None:
+        return None
+    groups = rec.get("groups") or []
+    if not groups:
+        return None
+    # куски конечностей слотятся как руки И ноги (3 группы) — каноническое семейство =
+    # legsrear (ровно 10 опций LimbA..J = 10 продуктов; у рук вариантов меньше)
+    gid = next((g for g in groups if g.startswith("LEGSR_")), groups[0])
+    wl = list((fv.get("groups") or {}).get(gid) or [])
+    exh = (rec.get("exhibits") or [None])[0]
+    root_scene = ((fv.get("exhibits") or {}).get(exh) or {}).get("scene") if exh else None
+    if not wl or not root_scene:
+        return None
+    root_key = _norm(root_scene)
+    bdir = os.path.dirname(root_key)
+    desc_ids = _folder_option_ids(bdir, extr)
+    all_ids = set().union(*desc_ids.values()) if desc_ids else set()
+    if not all_ids:
+        return None
+    wl_ext = {w.upper() for w in wl}
+
+    # 1) весь белый список живёт в ОДНОМ под-дескрипторе -> строим его сцену
+    #    (головы -> skulls, хвосты -> tail, конечности -> legsrear)
+    def covers(ids):
+        up = {i.upper() for i in ids}
+        return all(w in up or any(u.startswith(w) and re.fullmatch(r"LOD\d", u[len(w):]) for u in up)
+                   for w in wl_ext)
+    scene_key = None
+    covering = [k for k, ids in desc_ids.items() if covers(ids)]
+    if covering:
+        cand = min(covering, key=lambda k: len(desc_ids[k])).replace(".descriptor.mbin", ".scene.mbin")
+        if cand in extr.man:
+            scene_key = cand
+    if scene_key is None:
+        # 2) сборка от сцены стенда (тело = body.scene + шея necklong/neckshort):
+        #    добавить в белый список REF-опции корня, чьи под-сцены содержат наши узлы
+        scene_key = root_key
+        sfile = ensure_tree(scene_key, extr, geodirs)
+        if not sfile:
+            return None
+        root_ids = {i.upper() for i in (desc_ids.get(root_key.replace(".scene.mbin", ".descriptor.mbin")) or set())}
+        try:
+            troot = ET.parse(sfile).getroot()
+        except Exception:
+            return None
+
+        def scenegraphs(node, acc):
+            a = P(node, "Attributes")
+            if a is not None:
+                for c in a.findall("Property"):
+                    if c.get("value") == "TkSceneNodeAttributeData":
+                        nm, vl = P(c, "Name"), P(c, "Value")
+                        if nm is not None and vl is not None and nm.get("value") == "SCENEGRAPH":
+                            acc.append(vl.get("value"))
+            ch = P(node, "Children")
+            if ch is not None:
+                for c in ch.findall("Property"):
+                    if c.get("value") == "TkSceneNodeData":
+                        scenegraphs(c, acc)
+
+        def visit(node):
+            nm = P(node, "Name")
+            name = (nm.get("value").split("|")[-1] if nm is not None else "")
+            nu = name.upper()
+            if nu in root_ids and nu not in wl_ext:
+                sgs = []
+                scenegraphs(node, sgs)
+                for sg in sgs:
+                    dk = _norm(sg).replace(".scene.mbin", ".descriptor.mbin")
+                    ids = desc_ids.get(dk) or set()
+                    if any(_wl_keep(i.upper(), wl_ext) for i in ids):
+                        wl_ext.add(nu)
+                        break
+            ch = P(node, "Children")
+            if ch is not None:
+                for c in ch.findall("Property"):
+                    if c.get("value") == "TkSceneNodeData":
+                        visit(c)
+        visit(troot)
+
+    excl = sorted(i for i in all_ids if not _wl_keep(i.upper(), wl_ext))
+    regex = r"^(?:%s)$" % "|".join(re.escape(x) for x in excl) if excl else ""
+    note = "вариант по таблицам кастомизации игры: %s -> %s (%s)" % (
+        gid, os.path.basename(scene_key), " ".join(sorted(wl)))
+    return scene_key, regex, note
+
+
 # ------------------------------------------------------------------ ЕДИНОЕ ДРЕВО ДЕТАЛИ
 # Запрос юзера 07.07: при запекании группы вечно «не тот атлас или цвет» — программа
 # должна САМА безошибочно найти материалы/текстуры/цвета каждой детали из ПАКОВ и
@@ -781,10 +1129,11 @@ def collect_tree(scene_file, relax=False, depth=0, seen=None, prefix="", extra="
     skip_re = SKIPREF_RELAX if relax else SKIPREF
     extra_rx = re.compile(extra, re.I) if extra else None
     if seen is None:
-        seen = set()
+        seen = frozenset()
+    # seen = только предки пути (см. scene_lod0): повторные REF считаются по-инстансно
     if scene_file in seen or depth > 6:
         return []
-    seen.add(scene_file)
+    seen = frozenset(seen) | {scene_file}
     try:
         root = ET.parse(scene_file).getroot()
     except ET.ParseError:
@@ -812,7 +1161,10 @@ def collect_tree(scene_file, relax=False, depth=0, seen=None, prefix="", extra="
         m = LODRE.search(name.lower())
         lod = int(m.group(1)) if m else lod_ctx
         aa = attrs_of(node)
-        if typ == "MESH" and not SKIPNAME.search(name.lower()) and (lod is None or lod == 0):
+        # LODLEVEL = АВТОРИТЕТ (имена врут: fossils SF_01LOD4LOD0), см. conv2026
+        lvl = aa.get("LODLEVEL")
+        mesh_lod0 = (lvl == "0") if lvl not in (None, "") else (lod is None or lod == 0)
+        if typ == "MESH" and not SKIPNAME.search(name.lower()) and mesh_lod0:
             out.append((pfx + name, aa.get("MATERIAL", ""),
                         int(aa.get("BATCHCOUNT", 0) or 0) // 3))
         elif typ == "REFERENCE" and (lod is None or lod == 0):
@@ -1056,6 +1408,9 @@ def build_one(scene_file, asset, staging, relax=False, exclude=""):
     if relax:
         cc.SKIPREF = SKIPREF_RELAX
     if exclude:
+        # 13.07 (Fossils): опции сидят и во ВЛОЖЕННЫХ REF-сценах (biped_bones ->
+        # body/necklong) — верхнеуровневой фильтр-копии мало, режем на любой глубине
+        cc.EXCLUDE_NODE = re.compile(exclude, re.I)
         scene_file = filter_scene_variant(scene_file, exclude,
                                           os.path.join(staging, "_variant_" + asset + ".scene.MXML"))
     print(cc.build(scene_file, asset))
@@ -1211,23 +1566,49 @@ def main():
         link = links.get(oid) or links.get(ALIAS_PART.get(oid, ""))
         obj_style = ((link or {}).get("object") or {}).get("Style") or "None"
         styles_map = (link or {}).get("styles") or {}
-        scene_game = styles_map.get(obj_style)
-        if not scene_game and link:
-            placement = (link.get("object") or {}).get("PlacementScene") or link.get("scene")
-            if placement:
-                pid2 = placement_entity_partid(placement, extr)
-                if pid2:
-                    pst = load_partstable(args.index).get(pid2) or {}
-                    sc2 = pst.get(obj_style) or pst.get("None") or (next(iter(pst.values())) if pst else None)
-                    if sc2:
-                        scene_game = sc2
+        # 0.5) ДЕФОЛТ placement-entity АВТОРИТЕТНЕЕ styles-карты индексера (Corvette
+        # B_WALL_* 12.07: entity мульти-PartID NS/EW×стиль-модуля, дефолт NotSnapped =
+        # _BIGGS_WALL_EW_A с каютой/кухней, а индексер записал в styles первую NS-строку
+        # — «вся подгруппа одна голая стена»). Для обычных деталей entity-дефолт и
+        # styles совпадают; для сборок/без-ATTACHMENT возвращается None — идём как раньше.
+        scene_game = None
+        placement = ((link or {}).get("object") or {}).get("PlacementScene") or (link or {}).get("scene")
+        if placement:
+            pid2 = placement_entity_partid(placement, extr)
+            if pid2:
+                pst = load_partstable(args.index).get(pid2) or {}
+                sc2 = pst.get(obj_style) or pst.get("None") or (next(iter(pst.values())) if pst else None)
+                if sc2:
+                    scene_game = sc2
+                    if styles_map.get(obj_style) and styles_map.get(obj_style) != sc2:
+                        rec["flags"].append("entity-дефолт (%s) ≠ styles индексера — берём entity" % pid2)
+                    else:
                         rec["flags"].append("сцена из placement-entity игры (%s)" % pid2)
+        if not scene_game:
+            scene_game = styles_map.get(obj_style)
         if not scene_game and link:
             scene_game = link.get("scene")
         exclude_re = ""
         if not scene_game:
-            # ВАРИАНТ ПО ДЕСКРИПТОРУ ИГРЫ (фоссилы FOS_BI_BODY_AA и т.п.):
-            # базовая деталь -> REF-подсцена -> дескриптор -> комбинация опций
+            # ★ ВАРИАНТ ПО ТАБЛИЦАМ КАСТОМИЗАЦИИ ИГРЫ (фоссилы, 13.07): явный белый
+            # список узлов на каждый ItemID — авторитетнее буквенной формулы
+            cv = customisation_variant(oid, extr, geodirs, args.index)
+            if cv:
+                scene_game, exclude_re, vnote = cv
+                rec["flags"].append(vnote)
+        if not scene_game:
+            # ★ PARTSTABLE ПО PART-ID (витрины фоссилов 13.07: каталожные
+            # FOS_BODY_DISPLAY[_FLOOR/_WALL] = part-ID _FOS_* с СОБСТВЕННОЙ сценой;
+            # эвристика по имени ассета сажала их на чужой skull_display)
+            pst_probe = load_partstable(args.index).get("_" + oid) or {}
+            sc_probe = pst_probe.get(obj_style) or pst_probe.get("None") \
+                or (next(iter(pst_probe.values())) if pst_probe else None)
+            if sc_probe:
+                scene_game = sc_probe
+                rec["flags"].append("partstable по part-ID _%s" % oid)
+        if not scene_game:
+            # ВАРИАНТ ПО ДЕСКРИПТОРУ ИГРЫ (буквенная формула — фолбэк для семей,
+            # которых нет в таблицах кастомизации)
             dv = descriptor_variant(oid, links, extr, geodirs)
             if dv:
                 scene_game, exclude_re, vnote = dv
@@ -1266,6 +1647,17 @@ def main():
                 if rf and not scene_has_no_mesh(rf):
                     scene_game, scene_file = real, rf
                     rec["flags"].append("рантайм-конфиг игры (game-table) → " + real.split("/")[-1])
+        # ★ СБОРКА по entity-правилам (комнаты корвета B_HAB_*/B_LAN_B): placement-стуб
+        # без единого PartID — синтезируем сцену из NotSnapped-частей на локаторах
+        if scene_file and scene_has_no_mesh(scene_file):
+            placement2 = ((link or {}).get("object") or {}).get("PlacementScene") or (link or {}).get("scene")
+            if placement2:
+                asm = entity_assembly_scene(oid, placement2, obj_style, extr, args.index, geodirs,
+                                            os.path.join(staging, "_assembly_" + oid + ".scene.MXML"))
+                if asm:
+                    scene_file = asm[0]
+                    rec["flags"].append("СБОРКА по entity-правилам: %d частей%s" % (
+                        asm[1], ("; без сцены: " + ",".join(asm[2])) if asm[2] else ""))
         if extr and extr.n_extracted > n0:
             rec["flags"].append("извлечено из игры: %d файлов" % (extr.n_extracted - n0))
         if len(LEGACY_USED) > l0:
@@ -1342,7 +1734,15 @@ def main():
                 out["yellow"] = [c + " (но меш = принятый)" for c in creds] + out["yellow"]
             else:
                 out["red"].extend(creds)
-                out["red"].extend(hred)
+                # ХУЛЛ ОБЩИЙ НА СЕМЬЮ СТИЛЕЙ (Corvette 12.07): autogen-таблица держит
+                # ОДИН хулл на PartID направления (_BIGGS_EXTSTR_1X1_NE), а стилей у
+                # детали 21 — хулл = конверт максимального стиля, «меньше хулла» у
+                # меньших стилей НЕ дефект. Понижаем до ЖЁЛТ с пометкой.
+                _hull_szs = {tuple(h.get("size") or ()) for h in hulls.values()} if hulls else set()
+                if hred and len(styles_map) > 1 and len(_hull_szs) <= 1:
+                    out["yellow"].extend(h + " [хулл общий на семью стилей — глазом]" for h in hred)
+                else:
+                    out["red"].extend(hred)
                 out["yellow"].extend(hyel)
                 if nohull:
                     out["yellow"].append(nohull)
